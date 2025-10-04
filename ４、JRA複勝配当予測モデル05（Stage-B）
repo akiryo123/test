@@ -173,7 +173,7 @@ print(f"\n--- Cell-3: 時系列分割を開始 ---")
 df_sorted = df.sort_values("date").reset_index(drop=True)
 del df; gc.collect()
 
-#TRAIN_START_DATE = pd.to_datetime("2020-01-01")  # 時短モード！！！！！！！！！！！！！！！！
+#TRAIN_START_DATE = pd.to_datetime("2022-01-01")  # 時短モード！！！！！！！！！！！！！！！！
 TRAIN_START_DATE = pd.to_datetime("2016-01-01")
 VALID_START_DATE = pd.to_datetime("2023-04-01")
 VALID_END_DATE   = pd.to_datetime("2024-03-31")
@@ -615,6 +615,20 @@ gbm = lgb.train(
 best_iter = gbm.best_iteration or gbm.current_iteration()
 print(f"   ✅ 最適な学習回数 = {best_iter}")
 
+# === [PATCH] Valid を train-only モデル(gbm)で推論し、評価用に退避（リーク防止） ===
+_pcap = int(locals().get("PAYOUT_CAP", 1000))
+try:
+    pred_va_holdout = np.clip(
+        np.nan_to_num(gbm.predict(X_va, num_iteration=best_iter), nan=0.0, posinf=_pcap, neginf=0.0),
+        0.0, _pcap
+    ).astype("float32")
+    globals()["pred_va_holdout"] = pred_va_holdout  # Cell-7 で使う
+    print("   - [Eval Cache] pred_va_holdout を退避（gbm: train-only, leak-free）")
+except Exception as e:
+    print(f"[WARN] pred_va_holdout の退避に失敗: {e}")
+
+
+
 # 使い終えた中間を解放
 del lgb_train, lgb_valid, X_tr, X_va, y_tr, y_va, w_tr
 gc.collect()
@@ -726,36 +740,59 @@ y_va = df_all.loc[va_idx, TARGET_CAPPED].astype(float).values
 y_te = df_all.loc[te_idx, TARGET_CAPPED].astype(float).values
 
 # ===== 2) 生予測（raw） =====
+# 予測は用途で分ける:
+#  - train/test 用（提出物・配布物）：gbm_final
+#  - valid の評価値（ログ用）：gbm(train-only) or 退避済み pred_va_holdout
 pred_tr = _predict_ev(X_tr)
-pred_va = _predict_ev(X_va)
 pred_te = _predict_ev(X_te)
 
-# ===== 3) Isotonic 校正（年別OOFで学習 → クリップ） =====
+# gbm_final での valid 予測（配布物/可視化用に保持）
+pred_va_final = _predict_ev(X_va)
+
+# 評価専用の valid 予測（リークなし）
+if "pred_va_holdout" in globals():
+    pred_va_eval = np.asarray(pred_va_holdout, dtype="float32")
+    eval_src = "holdout_gbm_cached"
+elif 'gbm' in globals():
+    try:
+        pred_va_eval = np.clip(
+            np.nan_to_num(gbm.predict(X_va, num_iteration=BEST_ITER), nan=0.0, posinf=CAP, neginf=0.0),
+            0.0, CAP
+        ).astype("float32")
+        eval_src = "holdout_gbm_online"
+    except Exception as e:
+        print(f"[WARN] gbm での valid 推論に失敗: {e}")
+        pred_va_eval = pred_va_final
+        eval_src = "gbm_final_fallback(LEAK)"
+else:
+    print("[WARN] pred_va_holdout / gbm が見つからず、gbm_final にフォールバック（LEAK）")
+    pred_va_eval = pred_va_final
+    eval_src = "gbm_final_fallback(LEAK)"
+
+print(f"   - [Eval] Valid 予測ソース: {eval_src}")
+
+# ===== 3) Isotonic 校正（年別OOF + 重み付き） =====
 from sklearn.isotonic import IsotonicRegression
 import pickle as pkl
 
-# OOF を train 期間（= VALID_START_DATE より前）内で作る
+oof_pred_list, oof_true_list, oof_weight_list = [], [], []
+
+# OOF を train 期間内(dty < VALID_START_DATE)で構成
 dty = pd.to_datetime(df_all["date"])
 train_mask_oof = dty < pd.to_datetime(VALID_START_DATE)
 years_present = sorted(dty[train_mask_oof].dt.year.unique().tolist())
 
-oof_pred_list = []
-oof_true_list = []
-
 first_year = int(min(years_present)) if years_present else None
 for y in years_present:
     if y == first_year:
-        # 最初の年はそれ以前の履歴がないのでスキップ
-        continue
+        continue  # 初年度は履歴がなく学べないので skip
+
     ts_y = pd.Timestamp(f"{y}-01-01")
     te_y = pd.Timestamp(f"{y}-12-31")
-
     tr_m = (dty < ts_y) & train_mask_oof
     ho_m = (dty >= ts_y) & (dty <= te_y) & train_mask_oof
 
-    if not ho_m.any():
-        continue
-    if tr_m.sum() < 100:  # 学習行が少なすぎる場合はスキップ
+    if not ho_m.any() or tr_m.sum() < 100:
         continue
 
     X_tr_oof = df_all.loc[tr_m, feature_cols]
@@ -763,30 +800,40 @@ for y in years_present:
     w_tr_oof = make_weights(df_all.loc[tr_m])
 
     X_ho_oof = df_all.loc[ho_m, feature_cols]
-    dtr_oof = lgb.Dataset(X_tr_oof, label=y_tr_oof, weight=w_tr_oof, categorical_feature=categorical_cols)
-    mdl_oof = lgb.train(params, dtr_oof, num_boost_round=int(BEST_ITER if BEST_ITER is not None else 200))
+    dtr_oof   = lgb.Dataset(X_tr_oof, label=y_tr_oof, weight=w_tr_oof, categorical_feature=categorical_cols)
+    mdl_oof   = lgb.train(params, dtr_oof, num_boost_round=int(BEST_ITER if BEST_ITER is not None else 200))
 
-    ho_pred = mdl_oof.predict(X_ho_oof)
-    ho_pred = np.clip(np.nan_to_num(ho_pred, nan=0.0, posinf=CAP, neginf=0.0), 0, CAP).astype("float32")
-    ho_true = df_all.loc[ho_m, TARGET_CAPPED].astype(float).values
+    ho_pred   = np.clip(np.nan_to_num(mdl_oof.predict(X_ho_oof), nan=0.0, posinf=CAP, neginf=0.0), 0, CAP).astype("float32")
+    ho_true   = df_all.loc[ho_m, TARGET_CAPPED].astype(float).values
+    w_ho      = make_weights(df_all.loc[ho_m]).astype("float32")
 
     oof_pred_list.append(ho_pred)
     oof_true_list.append(ho_true)
+    oof_weight_list.append(w_ho)
 
-# OOF が無ければフォールバック（Validのみ）
-if len(oof_pred_list) == 0:
-    print("[CAL] OOFが得られなかったため、ValidのみでIsotonicを学習します。")
+# フィット
+calib_meta = {"weighted": True, "years": years_present}
+if len(oof_pred_list) > 0:
+    oof_pred   = np.concatenate(oof_pred_list)
+    oof_true   = np.concatenate(oof_true_list)
+    oof_weight = np.concatenate(oof_weight_list)
     iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(pred_va, y_va)
+    iso.fit(oof_pred, oof_true, sample_weight=oof_weight)
+    calib_meta.update({"type": "isotonic_oof_weighted", "n": int(len(oof_pred))})
+    print(f"   - [CAL] OOF weighted fit: n={len(oof_pred):,}")
 else:
-    oof_pred = np.concatenate(oof_pred_list)
-    oof_true = np.concatenate(oof_true_list)
-    iso = IsotonicRegression(out_of_bounds="clip")
-    iso.fit(oof_pred, oof_true)
+    # OOF不可 → Valid(holdout) で重み付きフィット（リークなし予測を使用）
+    w_va = make_weights(df_all.loc[va_idx]).astype("float32")
+    iso  = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(pred_va_eval, y_va, sample_weight=w_va)
+    calib_meta.update({"type": "isotonic_valid_weighted", "n": int(len(y_va))})
+    print(f"   - [CAL] Valid weighted fit (no OOF): n={len(y_va):,}, eval_src={eval_src}")
 
 # 適用（CAPクリップ）
-pred_va_cal = np.clip(iso.predict(pred_va), 0.0, CAP)
-pred_te_cal = np.clip(iso.predict(pred_te), 0.0, CAP)
+#  評価用（valid）はリークなし予測に適用、配布用（valid/test）は gbm_final 予測に適用
+pred_va_cal_eval  = np.clip(iso.predict(pred_va_eval), 0.0, CAP)
+pred_va_cal_final = np.clip(iso.predict(pred_va_final), 0.0, CAP)
+pred_te_cal       = np.clip(iso.predict(pred_te),      0.0, CAP)
 
 # 保存＆メタ追記
 iso_path = os.path.join(stage_b_dir, "JRA_stage_b_iso.pkl")
@@ -794,28 +841,29 @@ try:
     with open(iso_path, "wb") as f:
         pkl.dump(iso, f)
     if 'stage_b_meta' in globals():
-        stage_b_meta['calibration'] = {"type": "isotonic_oof", "path": iso_path, "years": years_present}
+        stage_b_meta['calibration'] = {"path": iso_path, **calib_meta}
         with open(STAGE_B_META_PATH, "w", encoding="utf-8") as f:
             json.dump(stage_b_meta, f, ensure_ascii=False, indent=2)
-    print(f"   - OOFベース校正器を保存しました: {iso_path}")
+    print(f"   - 校正器を保存しました: {iso_path} ({calib_meta['type']})")
 except Exception as e:
     print(f"[WARN] 校正器の保存に失敗: {e}")
 
 # ===== 4) メトリクス出力 =====
-# raw
+# raw（validはリークなしの pred_va_eval を使用）
 r2_tr,  mae_tr,  rmse_tr  = _metric(y_tr, pred_tr)
-r2_va,  mae_va,  rmse_va  = _metric(y_va, pred_va)
+r2_va,  mae_va,  rmse_va  = _metric(y_va, pred_va_eval)
 r2_te,  mae_te,  rmse_te  = _metric(y_te, pred_te)
 
-# calibrated
-r2_va_c, mae_va_c, rmse_va_c = _metric(y_va, pred_va_cal)
+# calibrated（validは pred_va_cal_eval を使用）
+r2_va_c, mae_va_c, rmse_va_c = _metric(y_va, pred_va_cal_eval)
 r2_te_c, mae_te_c, rmse_te_c = _metric(y_te, pred_te_cal)
 
 print(f"   - [Train(Mix)] R2={r2_tr:.4f}, MAE={mae_tr:.4f}, RMSE={rmse_tr:.4f}")
-print(f"   - [Valid(Mix)] R2={r2_va:.4f}, MAE={mae_va:.4f}, RMSE={rmse_va:.4f}")
+print(f"   - [Valid(Holdout)] R2={r2_va:.4f}, MAE={mae_va:.4f}, RMSE={rmse_va:.4f}")
 print(f"   - [Test(Mix)]  R2={r2_te:.4f}, MAE={mae_te:.4f}, RMSE={rmse_te:.4f}")
-print(f"   - [Valid Cal]  R2={r2_va_c:.4f}, MAE={mae_va_c:.4f}, RMSE={rmse_va_c:.4f}")
+print(f"   - [Valid Cal(Holdout)]  R2={r2_va_c:.4f}, MAE={mae_va_c:.4f}, RMSE={rmse_va_c:.4f}")
 print(f"   - [Test  Cal]  R2={r2_te_c:.4f}, MAE={mae_te_c:.4f}, RMSE={rmse_te_c:.4f}")
+
 
 # 参考：target_raw に対する一致（任意）
 try:
@@ -832,21 +880,34 @@ except Exception as e:
     print(f"[WARN] target_raw評価の計算でエラー: {e}")
 
 # ===== 5) スコア列の書き戻し（一貫してクリップ済みを利用） =====
-df_all.loc[va_idx, 'pred_score']      = pred_va
+# スコア列の書き戻し（配布用：gbm_final）
+df_all.loc[va_idx, 'pred_score']      = pred_va_final
 df_all.loc[te_idx, 'pred_score']      = pred_te
-df_all.loc[va_idx, 'pred_score_cal']  = pred_va_cal
+df_all.loc[va_idx, 'pred_score_cal']  = pred_va_cal_final
 df_all.loc[te_idx, 'pred_score_cal']  = pred_te_cal
 
-valid.loc[:, 'pred_score']     = pred_va
-test.loc[:,  'pred_score']     = pred_te
-valid.loc[:, 'pred_score_cal'] = pred_va_cal
-test.loc[:,  'pred_score_cal'] = pred_te_cal
+valid.loc[:, 'pred_score']            = pred_va_final
+test.loc[:,  'pred_score']            = pred_te
+valid.loc[:, 'pred_score_cal']        = pred_va_cal_final
+test.loc[:,  'pred_score_cal']        = pred_te_cal
+
+# 任意：評価用（リークなし）のトレース列
+try:
+    valid.loc[:, 'pred_score_eval']       = pred_va_eval
+    valid.loc[:, 'pred_score_eval_cal']   = pred_va_cal_eval
+except Exception:
+    pass
+
 
 _describe("pred_te(EV円)", pred_te)
 
 # ===== 6) メトリクス保存 =====
 metrics_path = os.path.join(stage_b_dir, "JRA_stage_b_metrics.json")
-note = "objective=regression_l2 / link=identity(raw_score=False) / pred_scoreは元スケール[円]"
+note = "objective=regression_l2 / link=identity(raw_score=False) / pred_scoreはgbm_final(配布)"
+meta_info = {
+    "valid_source": eval_src,
+    "calibration": calib_meta
+}
 with open(metrics_path, "w", encoding="utf-8") as f:
     json.dump({
         "train":     {"R2": float(r2_tr), "MAE": float(mae_tr), "RMSE": float(rmse_tr)},
@@ -854,9 +915,11 @@ with open(metrics_path, "w", encoding="utf-8") as f:
         "test":      {"R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)},
         "valid_cal": {"R2": float(r2_va_c), "MAE": float(mae_va_c), "RMSE": float(rmse_va_c)},
         "test_cal":  {"R2": float(r2_te_c), "MAE": float(mae_te_c), "RMSE": float(rmse_te_c)},
-        "note": note
+        "note": note,
+        "meta": meta_info
     }, f, ensure_ascii=False, indent=2)
 print(f"\n   ✅ メトリクス保存: {metrics_path}")
+
 
 # ===== 7) Parity 出力（cal も同梱） =====
 print("\n[PARITY] Train-side parity export 開始")
@@ -890,13 +953,21 @@ print(f"[PARITY] ✅ Train-side input saved: {parity_input_path} rows={len(tmp_i
 
 print('--- Cell-7: 完了 ---')
 
-# ===== 8) メモリ解放 =====
-del X_tr, X_va, X_te, y_tr, y_va, y_te, pred_tr, pred_va
-try:
-    del pred_te_cal, pred_va_cal
-except:
-    pass
+# ===== 8) メモリ解放（安全版） =====
+def _safe_del(*names):
+    g = globals()
+    for n in names:
+        if n in g:
+            del g[n]
+
+_safe_del(
+    "X_tr","X_va","X_te","y_tr","y_va","y_te",
+    "pred_tr","pred_te","pred_va","pred_va_holdout",
+    "pred_va_cal","pred_te_cal",
+    "oof_pred","oof_true","oof_weight"
+)
 gc.collect()
+
 
 
 # ────────────────────────────────────────────────
