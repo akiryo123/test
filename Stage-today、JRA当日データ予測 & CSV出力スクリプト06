@@ -1,0 +1,1674 @@
+# ==============================================================================
+# ５、JRA当日データ予測 & CSV出力スクリプト06
+#     （Stage-Today : BASE → CAND → SP まで。汎用ランナー削除版）
+# ==============================================================================
+
+# ────────────────────────────────────────────────
+# Cell-1 : ライブラリのインポートと全体設定
+# ────────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import polars as pl
+import pathlib
+import json
+import joblib
+import os
+import warnings
+import re
+import math
+import unicodedata as _ud
+import csv
+import gc
+import lightgbm as lgb
+from pathlib import Path
+from pandas.api.types import is_categorical_dtype
+
+warnings.filterwarnings("ignore")
+
+# --- 定数とパスの定義 (JRA06) ---
+PATH_TODAY_DATA_CSV = "/content/drive/My Drive/Colab/gpt/JRA06/JRA06_AI_today2025.csv"
+ARTIFACTS_BASE_DIR  = "/content/drive/My Drive/Colab/gpt/JRA06/"
+OUTPUT_DIR          = os.path.join(ARTIFACTS_BASE_DIR, "output")
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+PATH_OUTPUT_CSV     = os.path.join(OUTPUT_DIR, "jra_today_prediction.csv")
+IDENTIFIER_COLS     = ['date', 'race_code', 'race_number', 'horse_number']
+
+# --- アーティファクト（共通） ---
+J2E_JSON_PATH = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_place/j2e.json")
+
+# --- CAND 用アーティファクト ---
+CAND_DIR         = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_cand")
+CAND_MODEL_PATH  = os.path.join(CAND_DIR, "JRA_stage_cand_model.pkl")
+CAND_META_PATH   = os.path.join(CAND_DIR, "JRA_stage_cand_meta.json")
+CAND_FEAT_JSON   = os.path.join(CAND_DIR, "JRA_feature_cols_stage_cand.json")
+CAND_CAT_META    = os.path.join(CAND_DIR, "JRA_stage_cand_cat_meta.json")  # （任意）
+CAND_ISO_PATH    = os.path.join(CAND_DIR, "JRA_stage_cand_iso.pkl")
+CAND_GATE_JSON   = os.path.join(CAND_DIR, "JRA_stage_cand_bgi_gate.json")
+CAND_SCHEMA_JSON = os.path.join(CAND_DIR, "JRA_stage_cand_schema.json")    # あれば読む
+
+# --- SP 用アーティファクト（学習契約） ---
+SP_MODEL_DIR         = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_time_index_S")
+SP_MODEL_PATH        = os.path.join(SP_MODEL_DIR, "JRA_time_index_model.pkl")
+SP_UNIFIED_META_PATH = os.path.join(SP_MODEL_DIR, "JRA_sp_cat_meta.json")     # 高カーデ/カテゴリ/頻度メタ
+SP_META_PATH         = os.path.join(SP_MODEL_DIR, "JRA_time_index_meta.json") # best_iter 等
+SP_SCHEMA_PATH       = os.path.join(SP_MODEL_DIR, "JRA_sp_schema.json")       # 特徴量順/カテゴリ空間 契約
+
+# SP 用アーティファクト（学習契約）
+SP_TODAY_DIR           = os.path.join(SP_MODEL_DIR, "today")           # ← 追加
+os.makedirs(SP_TODAY_DIR, exist_ok=True)
+# today 専用の最小アーティファクト保存先（学習用と分離）
+SP_TODAY_DERIVED_PATH  = os.path.join(SP_TODAY_DIR, "JRA_derived_features_from_sp_model_today.parquet")
+SP_TODAY_SCHEMA_PATH   = os.path.join(SP_TODAY_DIR, "JRA_derived_features_from_sp_model_schema_today.json")
+
+# --- A 用アーティファクト（学習契約） ---
+STAGE_A_DIR            = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_a")
+STAGE_A_MODEL_PATH     = os.path.join(STAGE_A_DIR, "JRA_stage_a_model.pkl")
+STAGE_A_META_PATH      = os.path.join(STAGE_A_DIR, "JRA_stage_a_meta.json")
+STAGE_A_CAT_META_PATH  = os.path.join(STAGE_A_DIR, "JRA_stage_a_cat_meta.json")
+STAGE_A_SCHEMA_PATH    = os.path.join(STAGE_A_DIR, "JRA_stage_a_schema.json")
+
+# --- B 用アーティファクト（学習契約） ←★追加 ---
+STAGE_B_DIR        = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_b")
+STAGE_B_MODEL_PATH = os.path.join(STAGE_B_DIR, "JRA_stage_b_model.pkl")
+STAGE_B_META_PATH  = os.path.join(STAGE_B_DIR, "JRA_stage_b_meta.json")
+STAGE_B_ISO_PATH   = os.path.join(STAGE_B_DIR, "JRA_stage_b_iso.pkl")  # あれば Isotonic 校正を適用
+
+# --- C 用アーティファクト（学習契約 / today推論で使用） ---
+STAGE_C_DIR            = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_c")
+STAGE_C_MODEL_PATH     = os.path.join(STAGE_C_DIR, "JRA_stage_c_model.pkl")        # ←学習で保存追加を推奨
+STAGE_C_META_PATH      = os.path.join(STAGE_C_DIR, "JRA_stage_c_meta.json")
+STAGE_C_SF_MODEL_PATH  = os.path.join(STAGE_C_DIR, "JRA_stage_c_softfinish_model.pkl")
+STAGE_C_DERIVED_PATH   = os.path.join(STAGE_C_DIR, "JRA_derived_features_from_stage_c.parquet")  # 任意保存
+
+print("--- パス設定完了（JRA06） ---")
+
+
+
+# --- JRA06 Base と同型の集計対象 ---
+AGGREGATION_TARGET_COLS = [
+    "pred_time_index","pred_dash_index","score","score_v3","score_ver3",
+    "pred_odds","trifecta_support_rate","last_time_index",
+    "body_weight","jockey_rating","trainer_rating","baken_out",
+    "bgi_norm"
+]
+
+# ────────────────────────────────────────────────
+# Cell-1.5 : 補助ユーティリティ
+# ────────────────────────────────────────────────
+def log(msg): print(f"▶ {msg}")
+
+def _exists(p):
+    try:
+        return os.path.exists(p)
+    except:
+        return False
+
+def _load_json(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        if default is None:
+            log(f"[WARN] JSON not found or invalid: {path} ({e})")
+            return None
+        log(f"[WARN] JSON fallback({path}): {e}")
+        return default
+
+# ────────────────────────────────────────────────
+# Cell-2 : 前処理パイプライン（学習時 Base と完全互換/JRA06）
+# ────────────────────────────────────────────────
+def audit_code_cols(df: pd.DataFrame, tag: str):
+    cols = ["weight_type_code","race_type_code","coat_color_code","weather_code","sex_code"]
+    print(f"\n[AUDIT:{tag}] 重要コード列の健全性チェック")
+    for c in cols:
+        if c not in df.columns:
+            print(f"  - {c}: <COLUMN MISSING>")
+            continue
+        s = df[c]
+        kind = str(s.dtype)
+        sv = s.astype(str) if pd.api.types.is_categorical_dtype(s.dtype) else s
+        print(f"  - {c}: dtype={kind}, nunique={pd.Series(sv).nunique(dropna=True)}")
+        print("    head:", list(pd.Series(sv).head(6)))
+
+def _encode_marks(lf: pl.LazyFrame) -> pl.LazyFrame:
+    po_map  = {'0': 0, '☆': 1, '★': 2}
+    ana_map = {'0': 0, 'C': 1, 'B': 2, 'A': 3}
+    out_cols = []
+    if "po_horse_flag" in lf.columns:
+        out_cols.append(
+            pl.col("po_horse_flag").cast(pl.Utf8, strict=False).str.strip_chars()
+              .replace(po_map, default=0).cast(pl.Int8).alias("po_mark_rank")
+        )
+    if "anagusa_flag" in lf.columns:
+        out_cols.append(
+            pl.col("anagusa_flag").cast(pl.Utf8, strict=False).str.strip_chars()
+              .replace(ana_map, default=0).cast(pl.Int8).alias("anagusa_rank")
+        )
+    if not out_cols:
+        return lf
+    lf = lf.with_columns(out_cols).drop([c for c in ["po_horse_flag","anagusa_flag"] if c in lf.columns])
+    print("  - PO馬/穴ぐさを数値ランク化（po_mark_rank, anagusa_rank）")
+    return lf
+
+def _race_code_to_11str_expr():
+    return (
+        pl.when(pl.col("race_code").cast(pl.Int64, strict=False).is_not_null())
+            .then(pl.col("race_code").cast(pl.Int64, strict=False).cast(pl.Utf8))
+        .when(pl.col("race_code").cast(pl.Float64, strict=False).is_not_null())
+            .then(pl.col("race_code").cast(pl.Float64, strict=False).round(0).cast(pl.Int64).cast(pl.Utf8))
+        .otherwise(pl.col("race_code").cast(pl.Utf8, strict=False).str.replace(r"\.0$", ""))
+    ).str.replace_all(r"\D", "").str.zfill(11)
+
+_RC_LAST2_RE = r"^\d{9}(0[1-9]|1[0-2])$"
+
+def _to_11str_for_pd(x):
+    if pd.isna(x):
+        return None
+    s = str(x)
+    s = re.sub(r"\.0$", "", s)
+    s = re.sub(r"\D", "", s)
+    return s.zfill(11)
+
+def preprocess_today_data(raw_csv_path: str, j2e_path: str, agg_target_cols: list[str]):
+    print("\n◎◎◎ Stage-Today : BASE互換の前処理（JRA06）を開始 ◎◎◎")
+
+    with open(j2e_path, "r", encoding="utf8") as f:
+        j2e = json.load(f)
+    print("  - j2e.json を読み込みました。")
+
+    norm = lambda s: _ud.normalize("NFKC", s).strip()
+    with open(raw_csv_path, encoding="utf8", newline="") as f:
+        header_cols = next(csv.reader(f))
+    norm_map = {c: norm(c) for c in header_cols}
+
+    schema_fix = {
+        "転厩": pl.Utf8, "所属": pl.Utf8, "穴ぐさ": pl.Utf8, "PO馬": pl.Utf8,
+        "競走コード": pl.Utf8, "血統登録番号": pl.Utf8
+    }
+    lf = (
+        pl.read_csv(raw_csv_path, encoding="utf8",
+                    infer_schema_length=5_000,
+                    low_memory=False,
+                    truncate_ragged_lines=True,
+                    schema_overrides=schema_fix)
+        .lazy()
+        .rename(norm_map)
+    )
+    print("  - CSV を LazyFrame として読み込み、ヘッダーを正規化しました。")
+
+    jp2en_norm = {norm(k): v for k, v in j2e.items()}
+    rename_map_jp2en = {jp: en for jp, en in jp2en_norm.items() if jp in lf.columns}
+    lf = lf.rename(rename_map_jp2en)
+    print("  - 列名を日本語から英語に変換しました。")
+
+    if "date" in lf.schema:
+        lf = lf.with_columns(pl.col("date").str.strptime(pl.Datetime, "%Y/%m/%d %H:%M:%S", strict=False))
+        print("  - date を Datetime 化しました。")
+
+    if "race_code" not in lf.columns:
+        raise RuntimeError("race_code 列が見当たりません（j2e マッピングを確認）")
+    lf = lf.with_columns(_race_code_to_11str_expr().alias("race_code"))
+    _bad = (
+        lf.filter(~pl.col("race_code").str.contains(_RC_LAST2_RE))
+          .select("date","race_code","race_number").limit(5).collect()
+    )
+    if _bad.height > 0:
+        print("  ⚠ [today] race_code 形式が想定外（例示）:")
+        print(_bad)
+    else:
+        print("  - race_code 形式チェック（11桁 & 末尾01..12）OK")
+
+    HORSE_NAME_COL = "horse_name"
+    if HORSE_NAME_COL in lf.columns:
+        lf = lf.with_columns(pl.col(HORSE_NAME_COL).str.len_chars().fill_null(0).alias("horse_name_length"))\
+               .drop(HORSE_NAME_COL)
+        print("  - horse_name_length を作成し、元の horse_name を削除しました。")
+
+    lf = _encode_marks(lf)
+
+    if "horse_age" in lf.columns:
+        lf = lf.with_columns(
+            pl.when(pl.col("horse_age") == 2).then(pl.lit("2yo"))
+              .when(pl.col("horse_age") == 3).then(pl.lit("3yo"))
+              .otherwise(pl.lit("older")).alias("age_group")
+        )
+        print("  - age_group を作成しました。")
+
+    cols_to_create_cat_version = [
+        'venue_code','track_surface_code','track_code','distance',
+        'meeting_order','day_order','race_type_code','race_condition_code',
+        'race_condition_type_code','weather_code','surface_state_code',
+        'sex_code','horse_mark_code','coat_color_code',
+        'venue_change','track_change','class_change','mix_flag','apprentice_flag',
+        'first_time_jockey_flag','travel_flag','last_anomaly_code',
+        'jockey_region_code','trainer_region_code','trainer_affiliation_code'
+    ]
+    cat_exprs = [pl.col(c).cast(pl.Utf8).fill_null("__NA__").alias(f"{c}_cat")
+                 for c in cols_to_create_cat_version if c in lf.columns]
+    if cat_exprs:
+        lf = lf.with_columns(cat_exprs)
+        print(f"  - *_cat 特徴量を {len(cat_exprs)} 列追加しました。")
+
+    if "baken_out" in lf.columns:
+        _bmax = lf.select(pl.col("baken_out").cast(pl.Float64).max().alias("_mx")).collect(streaming=True)["_mx"][0]
+        _scale = 100.0 if (_bmax is not None and _bmax > 10) else 5.0
+        lf = lf.with_columns([
+            (pl.col("baken_out").cast(pl.Float32) / pl.lit(_scale)).clip(0.0,1.0).alias("bgi_norm"),
+            (pl.col("baken_out").cast(pl.Float32) * (100.0/_scale)).alias("bgi_score"),
+        ])
+        print(f"  - bgi_norm / bgi_score を追加（scale={_scale}）")
+
+    target_keywords = ["time_index","race_shape","popularity","pace_dev","last"]
+    cols_for_missing_flag = []
+    for col, dtype in lf.schema.items():
+        if dtype in pl.NUMERIC_DTYPES and any(k in col for k in target_keywords):
+            cols_for_missing_flag.append(col)
+    if cols_for_missing_flag:
+        lf = lf.with_columns([pl.col(c).is_null().cast(pl.Int8).alias(f"{c}_is_missing") for c in sorted(set(cols_for_missing_flag))])
+        print(f"  - 欠損フラグ列（{len(set(cols_for_missing_flag))} 列）を追加")
+
+    bin_exprs = []
+    if "distance_change" in lf.columns:
+        bin_exprs.append(
+            pl.when(pl.col("distance_change") == 0).then(pl.lit(0, dtype=pl.Int8))
+              .when(pl.col("distance_change").abs() <= 400).then(2 * pl.col("distance_change").sign())
+              .otherwise(3 * pl.col("distance_change").sign())
+              .cast(pl.Int8).alias("distance_change_bin")
+        )
+    if "score" in lf.columns:
+        bin_exprs.append(
+            pl.when(pl.col("score") <= 30).then(pl.lit(0, dtype=pl.Int8))
+              .when(pl.col("score") <= 40).then(pl.lit(1, dtype=pl.Int8))
+              .when(pl.col("score") <= 50).then(pl.lit(2, dtype=pl.Int8))
+              .when(pl.col("score") <= 54).then(pl.lit(3, dtype=pl.Int8))
+              .when(pl.col("score") <= 57).then(pl.lit(4, dtype=pl.Int8))
+              .otherwise(pl.lit(5, dtype=pl.Int8)).alias("score_bin")
+        )
+    if bin_exprs:
+        lf = lf.with_columns(bin_exprs)
+        print("  - 距離増減/score のビン化特徴量を追加")
+
+    race_keys = ["date","race_code","race_number"]
+    effective_agg_cols = [c for c in agg_target_cols if (c in lf.columns and lf.schema[c] in pl.NUMERIC_DTYPES)]
+    if effective_agg_cols:
+        agg_exprs = []
+        for col in effective_agg_cols:
+            agg_exprs += [
+                pl.col(col).sum().alias(f"{col}_race_sum"),
+                pl.col(col).mean().alias(f"{col}_race_mean"),
+                pl.col(col).var().alias(f"{col}_race_var"),
+                pl.col(col).std().alias(f"{col}_race_std"),
+                pl.col(col).max().alias(f"{col}_race_max"),
+                pl.col(col).min().alias(f"{col}_race_min"),
+                (pl.col(col).max() - pl.col(col).min()).alias(f"{col}_race_range"),
+                pl.col(col).skew().fill_nan(None).alias(f"{col}_race_skew"),
+                pl.col(col).kurtosis().fill_nan(None).alias(f"{col}_race_kurt"),
+            ]
+        df_tmp = lf.select(race_keys + effective_agg_cols).collect(streaming=True)
+        stats_df = df_tmp.group_by(race_keys, maintain_order=True).agg(agg_exprs)
+        lf = lf.join(stats_df.lazy(), on=race_keys, how="left", coalesce=True)
+        print(f"  - レース内集約統計量を追加（{len(effective_agg_cols)}×9 列）")
+
+    RELATIVE_TARGET_COLS = [
+        "pred_time_index","pred_dash_index","score","pred_odds","trifecta_support_rate",
+        "weight_carried","last_time_index","two_back_time_index","three_back_time_index",
+        "last_pace_dev","body_weight","place_rate","last_race_level","weight_ratio",
+        "jockey_rating","trainer_rating","bgi_norm"
+    ]
+    RANK_DESC_MAP = {
+        "pred_time_index": True, "pred_dash_index": True, "score": True,
+        "trifecta_support_rate": True, "last_time_index": True, "two_back_time_index": True,
+        "three_back_time_index": True, "body_weight": True, "place_rate": True,
+        "last_race_level": True, "jockey_rating": True, "trainer_rating": True,
+        "pred_odds": False, "weight_carried": False, "last_pace_dev": False, "weight_ratio": False,
+        "bgi_norm": True
+    }
+    rank_exprs = []
+    for col in RELATIVE_TARGET_COLS:
+        if col in lf.columns:
+            rank_exprs.append(
+                pl.col(col).rank(method="average", descending=RANK_DESC_MAP.get(col, True)).over(race_keys)
+                  .alias(f"{col}_rank_in_race")
+            )
+    if rank_exprs:
+        lf = lf.with_columns(rank_exprs)
+
+    other_exprs = []
+    eps = 1e-6
+    for col in RELATIVE_TARGET_COLS:
+        if col not in lf.columns:
+            continue
+        rank_col = f"{col}_rank_in_race"
+        mean_col = f"{col}_race_mean"
+        std_col  = f"{col}_race_std"
+        min_col  = f"{col}_race_min"
+        max_col  = f"{col}_race_max"
+        is_desc  = RANK_DESC_MAP.get(col, True)
+
+        if rank_col in lf.columns:
+            other_exprs += [
+                ((pl.col(rank_col) - 1) / (pl.len().over(race_keys) - 1).clip(lower_bound=1))
+                  .clip(0.0, 1.0).fill_nan(0.0).alias(f"{col}_rank_ratio"),
+                (pl.col(rank_col) == 1).cast(pl.Int8).alias(f"{col}_is_top1"),
+                (pl.col(rank_col) <= 3).cast(pl.Int8).alias(f"{col}_is_top3"),
+            ]
+        if mean_col in lf.columns:
+            other_exprs.append((pl.col(col) - pl.col(mean_col)).alias(f"{col}_diff_from_mean"))
+            if std_col in lf.columns:
+                other_exprs.append(((pl.col(col) - pl.col(mean_col)) / (pl.col(std_col) + eps)).alias(f"{col}_z_in_race"))
+        if min_col in lf.columns and max_col in lf.columns:
+            other_exprs += [
+                pl.when(is_desc).then(pl.col(max_col) - pl.col(col)).otherwise(pl.col(col) - pl.col(min_col)).alias(f"{col}_diff_to_top"),
+                pl.when(is_desc).then(pl.col(col) / (pl.col(max_col) + eps)).otherwise((pl.col(min_col) + eps) / (pl.col(col) + eps)).alias(f"{col}_share_of_top"),
+            ]
+    if other_exprs:
+        lf = lf.with_columns(other_exprs)
+        print("  - レース内相対特徴量群を追加")
+
+    if "bgi_norm" in lf.columns:
+        lf = lf.with_columns((pl.col("bgi_norm") - pl.col("bgi_norm").median().over(race_keys)).alias("bgi_gap_med"))
+        print("  - bgi_gap_med を追加")
+
+    top_margin_cols = ["trifecta_support_rate","pred_odds","pred_time_index","pred_dash_index","score","score_ver3"]
+    tm_exprs = []
+    for col in top_margin_cols:
+        if col in lf.columns:
+            is_desc = RANK_DESC_MAP.get(col, True)
+            top_val    = pl.col(col).sort(descending=is_desc).first().over(race_keys)
+            second_val = pl.col(col).sort(descending=is_desc).slice(1, 1).first().over(race_keys)
+            margin_expr = (top_val - second_val).abs().alias(f"{col}_top_margin_in_race")
+            tm_exprs += [margin_expr, (margin_expr / (top_val.abs() + eps)).alias(f"{col}_top_margin_norm_in_race")]
+    if tm_exprs:
+        lf = lf.with_columns(tm_exprs)
+        print("  - トップ独走度特徴量を追加")
+
+    lf = lf.with_columns([
+        (pl.col("date").dt.month()   / 12 * 2 * math.pi).sin().alias("month_sin"),
+        (pl.col("date").dt.month()   / 12 * 2 * math.pi).cos().alias("month_cos"),
+        (pl.col("date").dt.weekday() / 7  * 2 * math.pi).sin().alias("wday_sin"),
+        (pl.col("date").dt.weekday() / 7  * 2 * math.pi).cos().alias("wday_cos"),
+        (pl.col("date").dt.week()    / 52 * 2 * math.pi).sin().alias("week_sin"),
+        (pl.col("date").dt.week()    / 52 * 2 * math.pi).cos().alias("week_cos"),
+    ])
+    if "month" in lf.columns:
+        lf = lf.with_columns(
+            pl.when(pl.col("month").is_in([3,4,5])).then(pl.lit("Spring"))
+              .when(pl.col("month").is_in([6,7,8])).then(pl.lit("Summer"))
+              .when(pl.col("month").is_in([9,10,11])).then(pl.lit("Autumn"))
+              .otherwise(pl.lit("Winter")).alias("season")
+        )
+    print("  - 円環/季節 特徴量を追加")
+
+    if "distance" in lf.columns:
+        lf = lf.with_columns([
+            (((pl.col("distance") + 200) // 400) * 400).cast(pl.Int32).alias("distance_bin_400"),
+            pl.when(pl.col("distance") < 1400).then(pl.lit("spr"))
+              .when(pl.col("distance") <= 1899).then(pl.lit("mile"))
+              .when(pl.col("distance") <= 2399).then(pl.lit("inter"))
+              .otherwise(pl.lit("stayer")).alias("distance_band4"),
+            (pl.col("distance").cast(pl.Float64)).alias("dist_f"),
+        ]).with_columns([
+            (pl.col("dist_f")/1000.0).alias("dist_km"),
+            (pl.col("dist_f")**2).alias("dist_sq"),
+            (pl.col("dist_f")**3).alias("dist_cu"),
+        ])
+        if "track_surface_code" in lf.columns and "distance_band4" in lf.columns:
+            lf = lf.with_columns(
+                (pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__") + pl.lit("_") + pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")).alias("surface_distance_band4")
+            )
+
+    inter_exprs = []
+    if "venue_code" in lf.schema:
+        inter_exprs.append(pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__").alias("venue_code_str"))
+        if "track_surface_code" in lf.schema:
+            inter_exprs.append(
+                pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_surface_combo")
+            )
+            if "distance_band4" in lf.schema:
+                inter_exprs.append(
+                    pl.concat_str([
+                        pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"),
+                        pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"),
+                        pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")
+                    ]).alias("venue_surface_distance_band_combo")
+                )
+        if "track_code" in lf.schema:
+            inter_exprs.append(
+                pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("track_code").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_track_combo")
+            )
+        if "distance_band4" in lf.schema:
+            inter_exprs.append(
+                pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_distance_band4")
+            )
+
+    if inter_exprs:
+        lf = lf.with_columns(inter_exprs)
+        lf = lf.collect(streaming=True).lazy()
+        print("  - venue 交互作用（拡張）を追加し、バリアで確定")
+
+    if all(c in lf.columns for c in ["jockey_id","owner_code"]):
+        lf = lf.with_columns(
+            pl.concat_str([pl.col("jockey_id").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("owner_code").cast(pl.Utf8).fill_null("__NA__")]).alias("jockey_owner_combo")
+        )
+        print("  - jockey_owner_combo を追加")
+
+    freq_exprs = []
+    if "date" in lf.schema and isinstance(lf.schema["date"], pl.datatypes.Datetime):
+        for id_col in ["jockey_id","trainer_id","owner_code","breeder_code"]:
+            if id_col in lf.columns:
+                freq_exprs.append(pl.col(id_col).count().over([pl.col("date").dt.date(), id_col]).alias(f"{id_col}_day_freq"))
+                freq_exprs.append(pl.col(id_col).count().over(["race_code", id_col]).alias(f"{id_col}_race_freq"))
+    if freq_exprs:
+        lf = lf.with_columns(freq_exprs)
+        print(f"  - 頻度特徴量を {len(freq_exprs)} 列追加")
+
+    FIN_COLS  = ["last_finish","two_back_finish","three_back_finish"]
+    TI5_COLS  = ["last_time_index","two_back_time_index","three_back_time_index","four_back_time_index","five_back_time_index"]
+    POP_COLS  = ["last_popularity","two_back_popularity","three_back_popularity"]
+    past_exprs = []
+
+    fin_av = [c for c in FIN_COLS if c in lf.columns]
+    if fin_av:
+        past_exprs += [
+            pl.min_horizontal([pl.col(c) for c in fin_av]).alias("best_finish_last3"),
+            pl.mean_horizontal([pl.col(c) for c in fin_av]).alias("avg_finish_last3"),
+            pl.concat_list([pl.col(c) for c in fin_av]).list.eval(pl.element().std()).list.get(0).alias("std_finish_last3"),
+            pl.concat_list([pl.col(c) for c in fin_av]).list.eval(pl.element().var()).list.get(0).alias("var_finish_last3"),
+        ]
+        if "last_finish" in fin_av and "two_back_finish" in fin_av:
+            past_exprs.append((pl.col("two_back_finish") - pl.col("last_finish")).alias("finish_improve_L1_vs_L2"))
+
+    if any(c in lf.columns for c in TI5_COLS):
+        ti5_present = [c for c in TI5_COLS if c in lf.columns]
+        past_exprs += [
+            pl.max_horizontal([pl.col(c) for c in ti5_present]).alias("max_time_index_last5"),
+            pl.mean_horizontal([pl.col(c) for c in ti5_present]).alias("mean_time_index_last5"),
+            pl.concat_list([pl.col(c) for c in ti5_present]).list.eval(pl.element().std()).list.get(0).alias("std_time_index_last5"),
+            pl.concat_list([pl.col(c) for c in ti5_present]).list.eval(pl.element().var()).list.get(0).alias("var_time_index_last5"),
+        ]
+    if "last_time_index" in lf.columns and "two_back_time_index" in lf.columns:
+        past_exprs.append((pl.col("last_time_index") - pl.col("two_back_time_index")).alias("ti_trend_L1_minus_L2"))
+
+    pop_av = [c for c in POP_COLS if c in lf.columns]
+    if pop_av:
+        past_exprs += [
+            pl.min_horizontal([pl.col(c) for c in pop_av]).alias("best_popularity_last3"),
+            pl.mean_horizontal([pl.col(c) for c in pop_av]).alias("avg_popularity_last3"),
+            pl.concat_list([pl.col(c) for c in pop_av]).list.eval(pl.element().std()).list.get(0).alias("std_popularity_last3"),
+            pl.concat_list([pl.col(c) for c in pop_av]).list.eval(pl.element().var()).list.get(0).alias("var_popularity_last3"),
+        ]
+        if "last_popularity" in lf.columns and "two_back_popularity" in lf.columns:
+            past_exprs.append((pl.col("two_back_popularity") - pl.col("last_popularity")).alias("pop_improve_L1_vs_L2"))
+
+    if past_exprs:
+        lf = lf.with_columns(past_exprs)
+        print(f"  - 過去走派生を {len(past_exprs)} 列追加")
+
+    from polars.datatypes import List as ListDtype
+    list_cols = [n for n, dt in lf.schema.items() if isinstance(dt, ListDtype)]
+    if list_cols:
+        print("  ⚠ List 型列を削除:", list_cols)
+        lf = lf.drop(list_cols)
+
+    df_processed = lf.collect(streaming=True).to_pandas()
+    print(f"  - materialize 完了: df_processed shape={df_processed.shape}")
+
+    if "race_code" in df_processed.columns:
+        df_processed["race_code"] = df_processed["race_code"].map(_to_11str_for_pd).astype(str)
+
+    remain = [c for c in df_processed.columns if not re.fullmatch(r"[A-Za-z0-9_]+", c)]
+    if remain:
+        raise RuntimeError(f"未英語化列あり → {remain}")
+
+    id_cols_without_name = ['date','race_code','race_number','horse_number']
+    id_cols_present = [c for c in id_cols_without_name if c in df_processed.columns]
+    df_identifiers = df_processed[id_cols_present].copy()
+
+    df_original_names = pd.read_csv(
+        raw_csv_path,
+        usecols=['馬名','競走コード','馬番'],
+        dtype={'競走コード': str, '馬番': 'Int64'}
+    ).rename(columns={'馬名':'horse_name','競走コード':'race_code','馬番':'horse_number'})
+    df_original_names["race_code"] = df_original_names["race_code"].map(_to_11str_for_pd)
+    df_identifiers["race_code"]     = df_identifiers["race_code"].map(_to_11str_for_pd)
+
+    df_identifiers["horse_number"]  = pd.to_numeric(df_identifiers["horse_number"], errors="coerce").astype("Int64")
+    df_original_names["horse_number"] = df_original_names["horse_number"].astype("Int64")
+
+    df_identifiers = pd.merge(
+        df_identifiers, df_original_names,
+        on=["race_code","horse_number"], how="left"
+    )
+    print("  - 識別子（馬名含む）を確定:", list(df_identifiers.columns))
+
+    audit_code_cols(df_processed, "after-BASE-today")
+    print("✅ BASE互換の前処理を完了（JRA06）")
+    return df_processed, df_identifiers
+
+# ────────────────────────────────────────────────
+# Cell-3 : CAND（Stage-CANDと完全互換）
+# ────────────────────────────────────────────────
+def _logit(x, eps=1e-12):
+    x = np.clip(x, eps, 1-eps)
+    return np.log(x/(1-x))
+
+def _sigmoid(z):
+    return 1.0/(1.0 + np.exp(-z))
+
+def apply_T(p, T, eps=1e-15):
+    p = np.asarray(p, dtype=float)
+    p = np.clip(p, eps, 1-eps)
+    z = np.log(p/(1-p)) / max(T, eps)
+    return 1/(1+np.exp(-z))
+
+def safe_rank_desc(s):  # 大きいほど rank=1
+    return s.rank(method="min", ascending=False)
+
+def apply_safety_guards(df, prob_col, thr=0.95, min_keep=8, rescue_top_win_ratio=3,
+                        rescue_top_time_rank=2, rescue_top_tsr=0):
+    df = df.copy()
+    raw = (df[prob_col] >= thr).astype(bool)
+    final = raw.copy()
+    KEYS = ["date","race_code"]
+
+    if "predicted_win_ratio" in df.columns:
+        df["rk_win_ratio"] = df.groupby(KEYS)["predicted_win_ratio"].transform(safe_rank_desc)
+    else:
+        df["rk_win_ratio"] = np.inf
+
+    if "pred_time_index_rank" in df.columns:
+        df["rk_time_rank"] = df["pred_time_index_rank"].astype(float)
+    elif "pred_time_index_rank_in_race" in df.columns:
+        df["rk_time_rank"] = df["pred_time_index_rank_in_race"].astype(float)
+    else:
+        df["rk_time_rank"] = np.inf
+
+    if rescue_top_tsr>0 and "trifecta_support_rate" in df.columns:
+        df["rk_tsr"] = df.groupby(KEYS)["trifecta_support_rate"].transform(safe_rank_desc)
+    else:
+        df["rk_tsr"] = np.inf
+
+    rescue_win = rescue_time = rescue_tsr = fill_min = 0
+    for _, grp in df.groupby(KEYS, sort=False):
+        idx = grp.index
+        if rescue_top_win_ratio>0 and np.isfinite(grp["rk_win_ratio"]).any():
+            keep = grp.index[grp["rk_win_ratio"]<=rescue_top_win_ratio]
+            rescue_win += int(final.loc[keep].sum()); final.loc[keep] = False
+        if rescue_top_time_rank>0 and np.isfinite(grp["rk_time_rank"]).any():
+            keep = grp.index[grp["rk_time_rank"]<=rescue_top_time_rank]
+            rescue_time += int(final.loc[keep].sum()); final.loc[keep] = False
+        if rescue_top_tsr>0 and np.isfinite(grp["rk_tsr"]).any():
+            keep = grp.index[grp["rk_tsr"]<=rescue_top_tsr]
+            rescue_tsr += int(final.loc[keep].sum()); final.loc[keep] = False
+
+        n_keep  = int((~final.loc[idx]).sum())
+        if n_keep < min_keep:
+            cand = grp.loc[final.loc[idx], prob_col].sort_values(ascending=True)
+            need = min_keep - n_keep
+            back = cand.index[:max(0,need)]
+            final.loc[back] = False
+            fill_min += len(back)
+
+    summary = {
+        "rescued_by_win_ratio": rescue_win,
+        "rescued_by_time_rank": rescue_time,
+        "rescued_by_tsr": rescue_tsr if rescue_top_tsr>0 else 0,
+        "filled_min_keep": fill_min
+    }
+    return final.astype(bool), summary
+
+def _align_features(df: pd.DataFrame, feat_cols: list[str]) -> pd.DataFrame:
+    out = df.copy()
+    for c in feat_cols:
+        if c not in out.columns:
+            out[c] = 0.0
+    return out[feat_cols]
+
+def run_stage_cand(df_feat: pd.DataFrame) -> pd.DataFrame:
+    log("◎ Stage-CAND: load artifacts")
+    if not _exists(CAND_MODEL_PATH):
+        raise FileNotFoundError(f"CAND model not found: {CAND_MODEL_PATH}")
+    booster = lgb.Booster(model_file=CAND_MODEL_PATH)
+
+    T = 1.0
+    meta = _load_json(CAND_META_PATH, default={})
+    if meta and "temperature" in meta:
+        T = float(meta["temperature"])
+
+    feat_cols = _load_json(CAND_FEAT_JSON, default=[])
+    if not feat_cols:
+        raise FileNotFoundError(f"CAND feature list not found: {CAND_FEAT_JSON}")
+
+    ir = None; q_gate = None; gate_q = 0.80; lam = 0.20; margin = 0.03
+    schema = _load_json(CAND_SCHEMA_JSON, default=None)
+    if schema and "bgi_soft_blend" in schema:
+        bgi_s = schema["bgi_soft_blend"]
+        lam    = float(bgi_s.get("blend_lambda", 0.20))
+        gate_q = float(bgi_s.get("blend_gate_q", 0.80))
+        margin = float(bgi_s.get("blend_margin", 0.03))
+    try:
+        if _exists(CAND_ISO_PATH):
+            import pickle as pkl
+            with open(CAND_ISO_PATH, "rb") as f:
+                ir = pkl.load(f)
+        if _exists(CAND_GATE_JSON):
+            gj = _load_json(CAND_GATE_JSON, default={})
+            q_gate = float(gj.get("q_gate")) if "q_gate" in gj else None
+            if "gate_q" in gj: gate_q = float(gj["gate_q"])
+    except Exception as e:
+        log(f"[WARN] CAND BGI artifacts load failed: {e}")
+
+    X = _align_features(df_feat, feat_cols).astype(np.float32)
+
+    p_raw = booster.predict(X, num_iteration=booster.best_iteration or booster.current_iteration())
+    p_cal = apply_T(p_raw, T)
+
+    p_bgi = p_cal.copy()
+    if (ir is not None) and ("bgi_norm" in df_feat.columns):
+        bgi = df_feat["bgi_norm"].values.astype(float)
+        base = np.full_like(p_cal, np.nan)
+        m = np.isfinite(bgi)
+        try:
+            base[m] = ir.predict(bgi[m])
+        except Exception as e:
+            log(f"[WARN] Isotonic predict failed, skip blend: {e}")
+            base = None
+        if base is not None:
+            p_soft = _sigmoid((1 - lam) * _logit(p_cal) + lam * _logit(np.nan_to_num(base, nan=p_cal)))
+            q = q_gate if (q_gate is not None and np.isfinite(q_gate)) else (np.nanquantile(bgi, gate_q) if np.isfinite(bgi).any() else np.nan)
+            use = (bgi >= q) & ((base - p_cal) > margin) if np.isfinite(q) else (base - p_cal) > margin
+            p_bgi = np.where(use, p_soft, p_cal)
+
+    out = pd.DataFrame({
+        "cand_prob_4plus": p_cal.astype("float32"),
+        "cand_prob_4plus_bgi": p_bgi.astype("float32"),
+    }, index=df_feat.index)
+
+    RKEYS = ["date","race_code"]
+    grp_key = df_feat[RKEYS].apply(tuple, axis=1)
+    grp_mean = out.groupby(grp_key)["cand_prob_4plus"].transform("mean").values
+    grp_std  = out.groupby(grp_key)["cand_prob_4plus"].transform("std").values
+    grp_med  = out.groupby(grp_key)["cand_prob_4plus"].transform("median").values
+    rk_bad   = out["cand_prob_4plus"].groupby(grp_key).rank(method="min", ascending=False).values
+
+    out["keep_prob_in3"] = (1.0 - out["cand_prob_4plus"]).astype("float32")
+    out["cand_bad_rank_in_race"] = rk_bad.astype("float32")
+    out["cand_bad_z"] = ((out["cand_prob_4plus"] - grp_mean) / np.where(np.nan_to_num(grp_std)==0, np.nan, grp_std)).astype("float32")
+    out["cand_bad_gap"] = (out["cand_prob_4plus"] - grp_med).astype("float32")
+    out["exclude_margin_090"] = (out["cand_prob_4plus"] - 0.90).astype("float32")
+    out["exclude_margin_095"] = (out["cand_prob_4plus"] - 0.95).astype("float32")
+    out["bottom3_by_cand"] = (out["cand_prob_4plus"].groupby(grp_key).rank(method="min", ascending=False) <= 3).astype("int8")
+    out["sample_weight_cand"] = ((1.0 - out["cand_prob_4plus"])**1.5).astype("float32")
+
+    final_flag, summary = apply_safety_guards(
+        pd.concat([df_feat, out], axis=1),
+        "cand_prob_4plus_bgi",
+        thr=0.95, min_keep=8, rescue_top_win_ratio=3, rescue_top_time_rank=2, rescue_top_tsr=0
+    )
+    out["exclude_flag_095"] = final_flag.astype("int8")
+    log(f"  - SafetyGuard summary: {summary}")
+
+    return out
+
+# ──────────────────────────────────────────────────────────────
+# Cell-4 : AI能力指数（Stage-SP）予測と派生特徴量生成（JRA06・today）
+# ──────────────────────────────────────────────────────────────
+DERIVED_FEATURES_SP_PATH_TODAY   = SP_TODAY_DERIVED_PATH     # ← すでに定義済み（today/ 配下）
+DERIVED_FEATURES_SP_SCHEMA_TODAY = SP_TODAY_SCHEMA_PATH      # ← すでに定義済み（today/ 配下）
+
+
+def _log_today(msg: str):
+    print(f"▶ {msg}")
+
+def _ensure_columns(df: pd.DataFrame, cols, fill=0.0, dtype="float32"):
+    out = df.copy()
+    for c in cols:
+        if c not in out.columns:
+            out[c] = fill
+    for c in cols:
+        if (c in out.columns) and (out[c].dtype.kind in "biu"):
+            out[c] = out[c].astype(dtype)
+    return out[cols]
+
+def _normalize_merge_keys_pd(df_in: pd.DataFrame) -> pd.DataFrame:
+    df = df_in.copy()
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    if "race_code" in df.columns:
+        df["race_code"] = (
+            df["race_code"].astype(str)
+            .str.replace(r"\.0$", "", regex=True)
+            .str.replace(r"\D", "", regex=True)
+            .str.zfill(11)
+        )
+    if "horse_number" in df.columns:
+        df["horse_number"] = pd.to_numeric(df["horse_number"], errors="coerce").astype("Int64")
+    return df
+
+def predict_and_derive_sp_features(
+    df_input: pd.DataFrame,
+    model_path: str = SP_MODEL_PATH,
+    sp_unified_meta_path: str = SP_UNIFIED_META_PATH,
+    sp_general_meta_path: str = SP_META_PATH,
+    sp_schema_path: str = SP_SCHEMA_PATH,
+    *,
+    save_minimal_artifact: bool = True
+) -> pd.DataFrame:
+    if df_input is None or len(df_input) == 0:
+        print("  ❌ 入力が空です。処理を中断します。")
+        return None
+
+    print("\n◎◎◎ ステップ2: AI能力指数(Stage-SP)の予測と派生特徴量生成（JRA06/today）を開始 ◎◎◎")
+    df = df_input.copy()
+    df = _normalize_merge_keys_pd(df)
+
+    # モデル & メタ読み込み
+    try:
+        model = joblib.load(model_path)
+        with open(sp_unified_meta_path, "r", encoding="utf-8") as f:
+            sp_cat_meta = json.load(f)   # {high_card_cols, cat_cols_small, categories, freq_maps, ...}
+        with open(sp_general_meta_path, "r", encoding="utf-8") as f:
+            sp_general_meta = json.load(f)  # {"best_iter": ...}
+        with open(sp_schema_path, "r", encoding="utf-8") as f:
+            sp_schema = json.load(f)        # {"feature_names","category_cols","numeric_cols","categories":{...}}
+        print("  ✅ SPモデルとメタ(契約)を正常に読み込みました。")
+    except FileNotFoundError as e:
+        print(f"  ❌ 必須ファイルが見つかりません: {e}")
+        raise
+
+    # 高カーデ列 → 頻度特徴量
+    high_card_cols = sp_cat_meta.get("high_card_cols", [])
+    freq_maps = sp_cat_meta.get("freq_maps", {})
+    found_hc = [c for c in high_card_cols if c in df.columns]
+    for col in found_hc:
+        fmap = freq_maps.get(col, {})
+        df[f"{col}_freq"] = df[col].astype(str).map(fmap).astype("float32").fillna(0.0)
+    print(f"  - 高カーデ列の頻度化: {len(found_hc)}/{len(high_card_cols)} 列に適用")
+
+    # 小カーデ列 → Rare統合 & category化
+    cat_cols_small = sp_cat_meta.get("cat_cols_small", [])
+    categories_map = sp_cat_meta.get("categories", {})
+    found_small = [c for c in cat_cols_small if c in df.columns]
+    for col in found_small:
+        cats = list(categories_map.get(col, []))
+        if not cats:
+            raise ValueError(f"[契約違反] カテゴリ列 '{col}' のカテゴリ集合がメタにありません。")
+        if "___RARE___" not in cats:
+            cats.append("___RARE___")
+        ser = df[col].astype(str)
+        df[col] = pd.Categorical(ser.where(ser.isin(cats), "___RARE___"), categories=cats)
+    print(f"  - 小カーデ列のRare統合&カテゴリ化: {len(found_small)}/{len(cat_cols_small)} 列に適用")
+
+    # 契約に基づく列順の再現 & 欠損列補完
+    feature_names = sp_schema.get("feature_names", None)
+    cat_cols_schema = set(sp_schema.get("category_cols", []))
+    if not feature_names:
+        raise ValueError("スキーマ契約 'feature_names' が見つかりません。")
+
+    for c in feature_names:
+        if c in cat_cols_schema and c in df.columns and not isinstance(df[c].dtype, pd.CategoricalDtype):
+            cats = sp_schema.get("categories", {}).get(c, None)
+            if cats:
+                if "___RARE___" not in cats:
+                    cats.append("___RARE___")
+                df[c] = pd.Categorical(df[c].astype(str).where(df[c].astype(str).isin(cats), "___RARE___"),
+                                       categories=cats)
+            else:
+                df[c] = pd.Categorical(df[c].astype(str))
+
+    missing = [c for c in feature_names if c not in df.columns]
+    if missing:
+        print(f"  ⚠ 契約にあるが入力に無い列: {len(missing)} 件 → 0.0 補完します。例: {missing[:5]}")
+    X_sp = _ensure_columns(df, feature_names, fill=0.0, dtype="float32")
+
+    # 予測（log1p 逆変換・非負クリップ）
+    print("  - 予測を実行します...")
+    best_it = sp_general_meta.get("best_iter", None)
+    if isinstance(best_it, int) and best_it > 0:
+        pred_log = model.predict(X_sp, num_iteration=best_it)
+    else:
+        print("    ⚠ best_iter がメタに見当たらないため、全ツリーを使用します。")
+        pred_log = model.predict(X_sp)
+    preds = np.expm1(pred_log)
+    preds = np.clip(preds, a_min=0, a_max=None).astype("float32")
+    df["pred_time_index_sp"] = preds
+    print("  - 'pred_time_index_sp' を追加しました。")
+
+    # レース内派生
+    RACE_KEYS = [c for c in ["date", "race_code", "race_number"] if c in df.columns]
+    if len(RACE_KEYS) < 2:
+        raise ValueError("レース内派生のためのキー列(date/race_code/race_number)が不足しています。")
+
+    df["rank_pred_time_index_sp"] = df.groupby(RACE_KEYS)["pred_time_index_sp"].rank(method="min", ascending=False)
+    grp = df.groupby(RACE_KEYS)["pred_time_index_sp"]
+    df["mean_pred_time_index_sp_race"] = grp.transform("mean").astype("float32")
+    df["std_pred_time_index_sp_race"]  = grp.transform("std").astype("float32")
+
+    std_v  = df["std_pred_time_index_sp_race"].copy()
+    mean_v = df["mean_pred_time_index_sp_race"].copy()
+    dev = 50.0 + 10.0 * (df["pred_time_index_sp"] - mean_v) / std_v.replace(0, np.nan)
+    df["dev_pred_time_index_sp_race"] = dev.fillna(50.0).astype("float32")
+
+    df["top_pred_time_index_sp_race"] = grp.transform("max").astype("float32")
+    df["diff_to_top_pred_time_index_sp"] = (df["top_pred_time_index_sp_race"] - df["pred_time_index_sp"]).astype("float32")
+
+    for col in ["pred_time_index", "pred_time_index_rank", "trifecta_popularity_rank"]:
+        if col in df.columns:
+            df[f"diff_sp_vs_{col}"] = (df["pred_time_index_sp"] - df[col]).astype("float32")
+            df[f"diff_rank_sp_vs_{col}"] = (df["rank_pred_time_index_sp"] - df[col]).astype("float32")
+
+    print(f"  ✅ SP派生特徴量生成完了。データ形状: {df.shape}")
+
+    # today: 最小エクスポート（後段ステージ合流のため）
+    if save_minimal_artifact:
+        _log_today("Exporting minimal SP artifact for downstream stages...")
+        MERGE_KEYS = ["date", "race_code", "horse_number"]
+        keep_cols_core = [
+            "pred_time_index_sp",
+            "rank_pred_time_index_sp",
+            "mean_pred_time_index_sp_race",
+            "std_pred_time_index_sp_race",
+            "dev_pred_time_index_sp_race",
+            "top_pred_time_index_sp_race",
+            "diff_to_top_pred_time_index_sp",
+        ]
+        cols_exist = [c for c in keep_cols_core if c in df.columns]
+        df_export = df[MERGE_KEYS + cols_exist].copy()
+        df_export = _normalize_merge_keys_pd(df_export)
+
+        for c in cols_exist:
+            if pd.api.types.is_float_dtype(df_export[c]):
+                df_export[c] = df_export[c].astype("float32")
+            elif pd.api.types.is_integer_dtype(df_export[c]):
+                df_export[c] = df_export[c].astype("Int32")
+
+        if df_export.duplicated(MERGE_KEYS).any():
+            num_cols = [c for c in df_export.columns if c not in MERGE_KEYS]
+            df_export = df_export.groupby(MERGE_KEYS, as_index=False)[num_cols].mean()
+
+        try:
+            pl.from_pandas(df_export).write_parquet(DERIVED_FEATURES_SP_PATH_TODAY, compression="zstd")
+        except Exception:
+            df_export.to_parquet(DERIVED_FEATURES_SP_PATH_TODAY, index=False, engine="pyarrow", compression="zstd")
+        print(f"    - ✅ 保存: {DERIVED_FEATURES_SP_PATH_TODAY}  shape={df_export.shape}")
+
+        meta = {
+            "merge_keys": MERGE_KEYS,
+            "value_cols": cols_exist,
+            "dtypes": {c: str(df_export[c].dtype) for c in df_export.columns},
+            "n_rows": int(len(df_export)),
+            "n_cols": int(df_export.shape[1]),
+        }
+        with open(DERIVED_FEATURES_SP_SCHEMA_TODAY, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        print(f"    - ✅ スキーマ保存: {DERIVED_FEATURES_SP_SCHEMA_TODAY}")
+
+        nn = int(df_export["pred_time_index_sp"].notna().sum()) if "pred_time_index_sp" in df_export.columns else 0
+        print(f"    - pred_time_index_sp 非欠損: {nn:,}/{len(df_export):,} ({100.0*nn/max(1,len(df_export)):.1f}%)")
+
+    return df
+
+
+# ──────────────────────────────────────────────────────────────
+# Cell-5 : 複勝確率（Stage-A）予測と派生特徴量生成（JRA06/today・修正版）
+# ──────────────────────────────────────────────────────────────
+
+def _apply_temperature_scaling(p_raw, temp):
+    """温度スケーリングを適用して確率を較正する"""
+    eps = 1e-15
+    p = np.clip(p_raw, eps, 1 - eps)
+    logit = np.log(p / (1 - p))
+    scaled = logit / temp if temp > eps else logit
+    return 1 / (1 + np.exp(-scaled))
+
+def predict_and_derive_stage_a_features(df_input, model_path, meta_path,
+                                        stage_a_cat_meta_path, stage_a_schema_path):
+    if df_input is None:
+        return None
+    print("\n◎◎◎ ステップ3: 複勝確率(Stage-A)の予測と派生特徴量生成（JRA06/today）を開始 ◎◎◎")
+    df = df_input.copy()
+
+    # 1) モデル/メタ/スキーマのロード
+    try:
+        model = joblib.load(model_path)
+        with open(meta_path, 'r') as f:
+            meta = json.load(f)
+        with open(stage_a_cat_meta_path, "r", encoding="utf-8") as f:
+            cat_meta = json.load(f)
+        with open(stage_a_schema_path, "r", encoding="utf-8") as f:
+            schema = json.load(f)
+        print("  ✅ Stage-Aモデルとメタ(契約)を正常に読み込みました。")
+    except FileNotFoundError as e:
+        print(f"  ❌ エラー: Stage-Aモデルの必須ファイルが見つかりません: {e}")
+        raise
+
+    # 2) 学習時と同一の特徴量エンジニアリング（高カーデ頻度・Rare統合）
+    print("  - メタ(契約書)に基づき、学習時と同一の特徴量エンジニアリングを再現します...")
+
+    # 2-1) 高カーデ列 → 頻度エンコード
+    high_card_cols = cat_meta.get("high_card_cols", [])
+    freq_maps = cat_meta.get("freq_maps", {})
+    found_hc = [c for c in high_card_cols if c in df.columns]
+    for col in found_hc:
+        mp = freq_maps.get(col, {})
+        df[f"{col}_freq"] = df[col].astype(str).map(mp).astype("float32").fillna(0.0)
+    print(f"    - 高カーデ頻度化: {len(found_hc)}/{len(high_card_cols)} 列に適用")
+
+    # 2-2) 低カーデ列 → Rare統合＆カテゴリ化（一次）
+    cat_cols_small = cat_meta.get("cat_cols_small", [])
+    categories_map_train = cat_meta.get("categories", {})
+    found_small = [c for c in cat_cols_small if c in df.columns]
+    for col in found_small:
+        cats_train = list(categories_map_train.get(col, []))
+        if not cats_train:
+            raise ValueError(f"[契約違反] カテゴリ列 '{col}' のカテゴリ集合がメタにありません。")
+        if "___RARE___" not in cats_train:
+            cats_train.append("___RARE___")
+        ser = df[col].astype(str)
+        df[col] = pd.Categorical(ser.where(ser.isin(cats_train), "___RARE___"),
+                                 categories=cats_train)
+    print(f"    - 小カーデ列のRare統合&一時カテゴリ化: {len(found_small)}/{len(cat_cols_small)} 列に適用")
+
+
+    # --- 2-2.5) CAND 相対派生（rank / dev_from_mean）+ CAND×SP 矛盾圧縮 ---
+    # 学習時（JRA06 Stage-A）と同一の生成ルール：
+    #   - 'keep_prob_in3' と 'cand_prob_4plus' は「高いほど強い系」→ rank: ascending=False（1が強い）
+    #   - 'cand_bad_z' と 'cand_bad_gap' は「高いほど弱い系」→ rank: ascending=True（1が弱い側）
+    RACE_GRP = ['date', 'race_code']
+    base_cols_map = {
+        'keep_prob_in3': False,     # 降順ランク（1=強い側）
+        'cand_prob_4plus': False,   # 降順ランク（学習時に合わせる）
+        'cand_bad_z': True,         # 昇順ランク（1=弱い側）
+        'cand_bad_gap': True,       # 昇順ランク（1=弱い側）
+    }
+    created_cols = []
+    for col, asc in base_cols_map.items():
+        if col in df.columns:
+            grp = df.groupby(RACE_GRP)[col]
+            df[f"{col}_rank_in_race"] = grp.rank(method='min', ascending=asc).astype('float32')
+            df[f"{col}_dev_from_mean"] = (df[col] - grp.transform('mean')).astype('float32')
+            created_cols += [f"{col}_rank_in_race", f"{col}_dev_from_mean"]
+    print(f"    - CAND相対派生（rank/dev_from_mean）: 生成 {len(created_cols)} 列")
+
+    # CAND × SP の矛盾圧縮特徴（学習時と同一）
+    if ('cand_bad_z' in df.columns) and (('dev_pred_time_index_sp_race' in df.columns) or ('pred_time_index_sp' in df.columns)):
+        if 'dev_pred_time_index_sp_race' in df.columns:
+            sp_gap = df['dev_pred_time_index_sp_race'].astype('float32')
+        else:
+            grp_mean_sp = df.groupby(RACE_GRP)['pred_time_index_sp'].transform('mean')
+            sp_gap = (df['pred_time_index_sp'] - grp_mean_sp).astype('float32')
+        df['cand_vs_sp_contra'] = (-df['cand_bad_z'].astype('float32')) * sp_gap
+        print("    - CAND×SP 矛盾圧縮 'cand_vs_sp_contra' を生成")
+    else:
+        print("    - [WARN] 'cand_vs_sp_contra' を作れませんでした（必要列不足）")
+
+
+    # 2-3) リーク列の除外
+    leak_cols = [
+        "finishing_position","win_payout","place_payout","time_index",
+        "place_odds_1","win_odds","win_support_rate",
+        "implied_win_odds","implied_place_odds",
+        "trifecta_support_rate","trifecta_popularity_rank","zone"
+    ]
+    df_for_pred = df.drop(columns=leak_cols, errors="ignore")
+    print(f"  - 学習時同型化: リーク列候補 {len(leak_cols)} 列を除外")
+
+    # 3) スキーマ契約に基づく“厳密な型揃え”
+    model_features   = schema.get("feature_names", [])
+    cat_cols_schema  = set(schema.get("category_cols", []))
+    cats_schema_map  = schema.get("categories", {})
+
+    if not model_features:
+        raise ValueError("スキーマ契約 'feature_names' が見つかりません。")
+
+    # 必須列の存在チェック
+    missing = set(model_features) - set(df_for_pred.columns)
+    if missing:
+        raise ValueError(f"[契約違反] モデルが必要とする特徴量が入力データにありません: {sorted(list(missing))[:10]}")
+
+    # ★ここが重要：学習時の category_cols に“だけ”カテゴリ型を適用し、それ以外は float32 に固定
+    print("  - [同型化] スキーマの category_cols に合わせて dtype を強制整形します...")
+    for c in model_features:
+        if c in cat_cols_schema:
+            cats = list(cats_schema_map.get(c, []))
+            if "___RARE___" not in cats:
+                cats.append("___RARE___")
+            ser = df_for_pred[c].astype(str)
+            df_for_pred[c] = pd.Categorical(ser.where(ser.isin(cats), "___RARE___"),
+                                            categories=cats)
+        else:
+            # カテゴリ or object なら数値化 → float32（学習時は数値扱い）
+            if is_categorical_dtype(df_for_pred[c]) or (df_for_pred[c].dtype == "object"):
+                df_for_pred[c] = pd.to_numeric(df_for_pred[c].astype(str), errors="coerce")
+            df_for_pred[c] = df_for_pred[c].astype("float32")
+
+    # 余計な列がカテゴリ型になっていれば解除（保険：model_features に無い列は関与しないが念のため）
+    for c in df_for_pred.columns:
+        if (c not in model_features) and is_categorical_dtype(df_for_pred[c]):
+            df_for_pred[c] = df_for_pred[c].astype(str)
+
+    X_a = df_for_pred[model_features]
+    print(f"  - モデルへの入力特徴量を準備しました。形状: {X_a.shape}（カテゴリ列={len(cat_cols_schema)}）")
+
+    # 4) 予測 + 温度スケーリング
+    print("  - 予測と確率較正を実行します...")
+    best_iter   = meta.get("best_iter", None)
+    temperature = float(meta.get("temperature", 1.0))
+
+    if isinstance(best_iter, int) and best_iter > 0:
+        raw_preds = model.predict(X_a, num_iteration=best_iter)
+    else:
+        raw_preds = model.predict(X_a)
+
+    calibrated = _apply_temperature_scaling(raw_preds, temperature)
+    df["pred_prob_stage_a"] = calibrated.astype("float32")
+    print(f"    - 予測と較正完了 (T={temperature:.4f})。'pred_prob_stage_a' を追加")
+
+    # 5) 予測値から派生特徴量
+    print("  - 予測確率から追加派生特徴量を生成します...")
+    P = df["pred_prob_stage_a"].clip(0, 1).astype("float32")
+
+    if "trifecta_support_rate" not in df.columns or df["trifecta_support_rate"].isna().all():
+        raise RuntimeError("❌ 'trifecta_support_rate' が存在しないか全欠損です。派生特徴量を計算できません。")
+    tsr_raw = pd.to_numeric(df["trifecta_support_rate"], errors="coerce")
+    Q_tri = (tsr_raw / 100.0).clip(lower=1e-4, upper=0.9999).astype("float32")
+    df["implied_prob_place_tri"] = Q_tri
+
+    odds_tri = (1.0 / Q_tri).clip(lower=1.01, upper=99.9)
+    df["ev_pct_tri"]     = ((P * odds_tri - 1.0) * 100.0).astype("float32")
+    kelly_raw            = ((P * odds_tri - 1.0) / (odds_tri - 1.0)).clip(-2, 2)
+    df["kelly_raw_tri"]  = kelly_raw.astype("float32")
+    df["kelly_clip_tri"] = kelly_raw.clip(0, 1).astype("float32")
+
+    kelly_dev_score_raw = ((P * odds_tri - 1.0) / (odds_tri - 1.0)).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    df["kelly_deviation_score"] = (50.0 + 50.0 * kelly_dev_score_raw.clip(-1, 1)).astype("float32")
+    df["prob_gap_vs_win"] = (P - Q_tri).astype("float32")
+
+    RACE_ID = ["date", "race_code"]
+    if "pred_time_index_sp" in df.columns:
+        grp_sp_mean = df.groupby(RACE_ID)["pred_time_index_sp"].transform("mean")
+        df["sp_gap"] = (df["pred_time_index_sp"] - grp_sp_mean).astype("float32")
+        df["sp_rank_in_race"] = df.groupby(RACE_ID)["pred_time_index_sp"].rank(method="min", ascending=False)
+        cnt_sp = df.groupby(RACE_ID)["pred_time_index_sp"].transform("count")
+        df["sp_percentile"] = ((df["sp_rank_in_race"] - 1) / (cnt_sp - 1).clip(lower=1)).astype("float32")
+
+    df["pred_prob_stage_a_race_rank"] = df.groupby(RACE_ID)["pred_prob_stage_a"].rank(method="min", ascending=False)
+    if "sp_rank_in_race" in df.columns:
+        df["pA_rank_dev"] = (df["pred_prob_stage_a_race_rank"] - df["sp_rank_in_race"]).astype("float32")
+
+    mean_prob = df.groupby(RACE_ID)["pred_prob_stage_a"].transform("mean")
+    std_prob  = df.groupby(RACE_ID)["pred_prob_stage_a"].transform("std")
+    df["pred_prob_stage_a_race_mean"] = mean_prob.astype("float32")
+    df["pred_prob_stage_a_race_std"]  = std_prob.astype("float32")
+    df["pA_cv_race"] = (std_prob / mean_prob.replace(0, np.nan)).astype("float32")
+
+    print(f"  ✅ Stage-A派生特徴量生成完了。データ形状: {df.shape}")
+    return df
+
+
+# ──────────────────────────────────────────────────────────────
+# Cell-6 : 複勝配当（Stage-B）予測（★JRA06 最終堅牢版）
+# ──────────────────────────────────────────────────────────────
+def predict_stage_b(df_input, model_path, meta_path, iso_path: str | None = None):
+    """
+    学習時(Stage-B)と同一の前処理を再現して予測する today 専用セル（JRA06）。
+      - train-only の頻度エンコードを契約メタ freq_maps で再現
+      - 低カーデカテゴリは契約メタ categories で Rare 統合＆category 型固定
+      - モデルに合わせて列を完全一致（不足列は安全既定で補完）
+      - 予測は CAP でクリップし、可能なら Isotonic 校正も適用
+    出力列:
+      - pred_ev_stage_b        : 生予測（CAPクリップ済み, 円）
+      - pred_ev_stage_b_cal    : Isotonic校正後（あれば, 円）
+    """
+    if df_input is None:
+        return None
+
+    import json, pickle as pkl
+    import numpy as np
+    import pandas as pd
+    import lightgbm as lgb
+
+    print("\n◎◎◎ ステップ4: 複勝配当(Stage-B)の予測を開始 ◎◎◎")
+    df = df_input.copy()
+
+    # --- 1) モデル & 契約メタ 読み込み ---
+    try:
+        try:
+            booster = lgb.Booster(model_file=model_path)  # 学習では save_model を使用
+        except Exception:
+            # フォールバック（万一pickle保存だった場合）
+            import joblib
+            booster = joblib.load(model_path)
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        print("  ✅ Stage-Bモデルと統一メタファイルを読み込みました。")
+    except Exception as e:
+        print(f"  ❌ エラー: モデル/メタの読み込み失敗: {e}")
+        raise
+
+    schema = (meta.get("schema") or {})
+    categories_map_from_schema = schema.get("categories", {})      # {col: [cats...]}
+    numeric_cols_from_schema   = set(schema.get("numeric_cols", []))
+    category_cols_from_schema  = set(schema.get("category_cols", []))
+
+    # --- 2) 学習時と同一の特徴量エンジニアリング（契約再現） ---
+    print("  - 契約メタに基づく特徴量エンジニアリングを再現します...")
+
+    # 2-1) 高カーディナリティ列の頻度化（train-only 比率を適用）
+    high_card_cols = meta.get("high_card_cols", [])
+    freq_maps      = meta.get("freq_maps", {})
+    found_high = [c for c in high_card_cols if c in df.columns]
+    for col in found_high:
+        mp = freq_maps.get(col, {})
+        df[f"{col}_freq"] = df[col].astype(str).map(mp).astype("float32").fillna(0.0)
+    print(f"    - 高カーデ列を頻度特徴へ変換: {len(found_high)}/{len(high_card_cols)}")
+
+    # 2-2) 低カーデカテゴリ列（train語彙で Rare 統合＆category 固定）
+    #      * cat_cols は学習メタ（互換）or schema の category_cols を優先
+    cat_cols_meta = meta.get("cat_cols", [])
+    cat_cols = list(dict.fromkeys(cat_cols_meta or list(category_cols_from_schema)))
+    found_cat = [c for c in cat_cols if c in df.columns]
+    for col in found_cat:
+        # 語彙は schema.categories を優先（なければ meta.categories）
+        known = list(categories_map_from_schema.get(col, meta.get("categories", {}).get(col, [])))
+        if '___RARE___' not in known:
+            known.append('___RARE___')
+        ser = df[col].astype(str)
+        ser = ser.where(ser.isin(known), '___RARE___')
+        df[col] = pd.Categorical(ser, categories=known)
+    print(f"    - 低カーデカテゴリ整形: {len(found_cat)}/{len(cat_cols)}")
+
+    # --- 3) 特徴量行列の構築（モデルの列と完全一致） ---
+    try:
+        expected_features = list(booster.feature_name())  # 学習時に実際に使われた列を真とする
+        if not expected_features:
+            raise ValueError("モデルから feature_name を取得できませんでした。")
+    except Exception as e:
+        print(f"  ❌ エラー: feature_name 取得失敗: {e}")
+        raise
+
+    # 不足列を安全既定で補完（数値=0.0、カテゴリ=Rare カテゴリで category 型）
+    categories_all = categories_map_from_schema or meta.get("categories", {})
+    for c in expected_features:
+        if c not in df.columns:
+            if c in categories_all:
+                cats = list(categories_all[c])
+                if '___RARE___' not in cats:
+                    cats.append('___RARE___')
+                df[c] = pd.Categorical(['___RARE___'] * len(df), categories=cats)
+            else:
+                df[c] = np.float32(0.0)
+
+    # 余計な列は自動で落ちるよう、モデル列順で reindex
+    X_b = df.reindex(columns=expected_features)
+
+    # 数値であるべき列を明示float化（念のため）
+    # （schema に numeric_cols がある場合のみ矯正）
+    for c in expected_features:
+        if c in numeric_cols_from_schema:
+            if pd.api.types.is_categorical_dtype(X_b[c]) or X_b[c].dtype == 'object':
+                X_b[c] = pd.to_numeric(X_b[c].astype(str), errors='coerce').fillna(0.0).astype('float32')
+
+    print(f"  - モデル入力を準備しました: shape={X_b.shape}")
+
+    # --- 4) 推論（best_iterationを尊重）＆ CAP クリップ ---
+    best_iter = int(meta.get("best_iteration", -1)) if isinstance(meta.get("best_iteration", -1), int) else -1
+    cap       = int(meta.get("payout_cap", 1000))
+    print(f"  - 推論を実行（best_iteration={best_iter if best_iter>0 else 'last'} / CAP={cap}）...")
+    try:
+        preds_raw = booster.predict(X_b, num_iteration=best_iter if best_iter > 0 else -1)
+    except TypeError:
+        # LightGBM のバージョン差異対策
+        preds_raw = booster.predict(X_b)
+
+    pred_ev = np.clip(np.nan_to_num(preds_raw, nan=0.0, posinf=cap, neginf=0.0), 0.0, cap).astype("float32")
+    df["pred_ev_stage_b"] = pred_ev
+
+    # --- 5) Isotonic 校正（存在すれば適用） ---
+    if iso_path is None:
+        iso_path = (meta.get("calibration") or {}).get("path")
+    if iso_path:
+        try:
+            with open(iso_path, "rb") as f:
+                iso = pkl.load(f)
+            df["pred_ev_stage_b_cal"] = np.clip(iso.predict(pred_ev), 0.0, cap).astype("float32")
+            print(f"    - Isotonic 校正を適用しました: {iso_path}")
+        except Exception as e:
+            print(f"    - [WARN] Isotonic 校正器の読み込み/適用に失敗: {e}")
+    else:
+        print("    - Isotonic 校正器が未指定のため、cal 列は作成しません。")
+
+    print(f"  ✅ Stage-B 予測完了。出力列: {['pred_ev_stage_b'] + (['pred_ev_stage_b_cal'] if 'pred_ev_stage_b_cal' in df.columns else [])}  形状={df.shape}")
+    return df
+
+
+# ──────────────────────────────────────────────────────────────
+# Cell-7 :単勝的中（Stage-C）予測（★JRA06 最終堅牢版）
+#  - 重要変更点（恒久対応）
+#    * Soft-Finish/Stage-C ともに推論は lgb.Dataset を使わず Booster.predict(DataFrame) で実行
+#    * 学習メタに保存した「カテゴリ全集合」を today 側に強制適用（未知は "__NA__" へ）
+#    * num_horses_bin4/season/distance_bin_400/distance_class3 を確実に生成
+#    * レース内 softmax（温度Tはメタから）
+# ──────────────────────────────────────────────────────────────
+def predict_stage_c_today(
+    df_input: pd.DataFrame,
+    model_path: str = None,
+    meta_path: str = None,
+    sf_model_path: str = None,
+    stage_b_meta_path: str = None,
+    derived_save_path: str = None
+):
+    """
+    JRA06 学習版 Stage-C の“契約”に基づき、today データから単勝的中確率を推論する。
+    - Soft-Finish 補助モデルを適用（winsorize 含む）
+    - レース内 softmax + 温度較正（学習時温度T）で pred_win_prob を確定
+    - 可能なら最小派生成果物（MERGE_KEYS + pred_win_prob）を Parquet 保存
+    """
+    if df_input is None or len(df_input) == 0:
+        print("  ❌ Stage-C: 入力が空です。スキップします。")
+        return df_input
+
+    print("\n◎◎◎ ステップ4: 単勝(Stage-C)の予測（JRA06/today）を開始 ◎◎◎")
+    df = df_input.copy()
+
+    # --- 0) パスの既定（グローバル未定義でも動くように） ---
+    try:
+        base_dir = globals().get("ARTIFACTS_BASE_DIR", "/content/drive/My Drive/Colab/gpt/JRA06")
+        # Stage-C 契約/モデル
+        STAGE_C_DIR_DEF             = os.path.join(base_dir, "artifacts_stage_c")
+        model_path       = model_path       or globals().get("STAGE_C_MODEL_PATH",     os.path.join(STAGE_C_DIR_DEF, "JRA_stage_c_model.pkl"))
+        meta_path        = meta_path        or globals().get("STAGE_C_META_PATH",      os.path.join(STAGE_C_DIR_DEF, "JRA_stage_c_meta.json"))
+        sf_model_path    = sf_model_path    or globals().get("STAGE_C_SF_MODEL_PATH",  os.path.join(STAGE_C_DIR_DEF, "JRA_stage_c_softfinish_model.pkl"))
+        derived_save_path= derived_save_path or globals().get(
+            "STAGE_C_DERIVED_PATH",
+            os.path.join(STAGE_C_DIR_DEF, "JRA_derived_features_from_stage_c.parquet")
+        )
+        stage_b_meta_path= stage_b_meta_path or globals().get(
+            "STAGE_B_META_PATH",
+            os.path.join(base_dir, "artifacts_stage_b", "JRA_stage_b_meta.json")
+        )
+        os.makedirs(os.path.dirname(derived_save_path), exist_ok=True)
+    except Exception:
+        pass
+
+    # --- 1) 契約（メタ）とモデルの読込 ---
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        booster = lgb.Booster(model_file=model_path)
+        print("  ✅ Stage-Cモデルとメタ(契約)を正常に読み込みました。")
+    except Exception as e:
+        raise RuntimeError(f"[Stage-C] モデル/メタの読み込みに失敗: {e}")
+
+    FEATURES_C       = list(meta.get("features", []))
+    CAT_FEATURES_C   = list(meta.get("categorical_features", []))
+    CAT_MAP_C        = dict(meta.get("cat_categories_c", {}))  # ← 学習時カテゴリ全集合（任意）
+    BEST_ITER        = int(meta.get("best_iter", -1))
+    TEMP_SOFTMAX     = float(meta.get("temperature_softmax", 1.0))
+
+    # --- 2) キー整形（groupbyの安定性確保） ---
+    def _to_11str_failsafe(x):
+        s = str(x)
+        s = re.sub(r"\.0$", "", s)
+        return s.zfill(11)
+
+    _to11 = globals().get("_to_11str_for_pd", _to_11str_failsafe)
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    if "race_code" in df.columns:
+        df["race_code"] = df["race_code"].map(_to11).astype("string")
+    if "horse_number" in df.columns:
+        df["horse_number"] = pd.to_numeric(df["horse_number"], errors="coerce").astype("Int64")
+
+    # --- 3) Stage-B(any) を today 内で合成（OOF は無いので pred 系を優先） ---
+    payout_cap_b = 1000
+    try:
+        if stage_b_meta_path and os.path.exists(stage_b_meta_path):
+            with open(stage_b_meta_path, "r", encoding="utf-8") as f:
+                _mb = json.load(f)
+            payout_cap_b = int(_mb.get("payout_cap", payout_cap_b))
+    except Exception:
+        pass
+
+    if "pred_ev_stage_b_any" not in df.columns:
+        if "pred_ev_stage_b_cal" in df.columns:
+            se = pd.to_numeric(df["pred_ev_stage_b_cal"], errors="coerce")
+        elif "pred_payout_blend" in df.columns:
+            se = pd.to_numeric(df["pred_payout_blend"], errors="coerce")
+        elif "pred_score" in df.columns:
+            se = pd.to_numeric(df["pred_score"], errors="coerce").clip(lower=0, upper=payout_cap_b)
+        else:
+            se = pd.Series(np.nan, index=df.index, dtype="float32")
+        df["pred_ev_stage_b_any"] = se.astype("float32")
+    cov_b_any = float(df["pred_ev_stage_b_any"].notna().mean() if "pred_ev_stage_b_any" in df.columns else 0.0)
+    print(f"  - Stage-B(any) カバレッジ: {cov_b_any*100:.1f}%")
+
+    # --- 4) 追加カテゴリ/派生（学習時と一致させる） ---
+    # 4-1) season / distance_bin_400 / distance_class3 / num_horses_bin4
+    def _season(m):
+        if m in (3,4,5):   return "Spring"
+        if m in (6,7,8):   return "Summer"
+        if m in (9,10,11): return "Autumn"
+        return "Winter"
+
+    if "month" in df.columns:
+        df["season"] = df["month"].map(_season).astype("string").fillna("__NA__").astype("category")
+    if "distance" in df.columns:
+        df["distance_bin_400"] = ((pd.to_numeric(df["distance"], errors="coerce") // 400) * 400) \
+                                    .astype("Int64").astype("string").fillna("__NA__").astype("category")
+        df["distance_class3"] = pd.cut(
+            pd.to_numeric(df["distance"], errors="coerce").astype(float),
+            bins=[0, 1400, 2000, 10000],
+            labels=["Short","Middle","Long"],
+            include_lowest=True
+        ).astype("category")
+    if "num_horses" in df.columns:
+        bins   = [0, 8, 12, 16, 99]
+        labels = ["<=8", "9-12", "13-16", "17+"]
+        df["num_horses_bin4"] = pd.cut(pd.to_numeric(df["num_horses"], errors="coerce"),
+                                       bins=bins, labels=labels, right=True, include_lowest=True).astype("category")
+
+    # 4-2) レース内 rank/z/gap（学習で使った可能性のある列群のみ）
+    RACE_KEYS = ["date","race_code"]
+    race_feats_src = [
+        "pred_time_index","pred_dash_index","score","score_w","score_ver3","default_score",
+        "pred_time_index_sp",
+        "pred_prob_stage_a",
+        "pred_ev_stage_b_any"
+    ]
+    for col in race_feats_src:
+        if col not in df.columns:
+            continue
+        s = pd.to_numeric(df[col], errors="coerce").astype(float)
+        df[f"r_{col}"] = s.groupby(df[RACE_KEYS].apply(tuple, axis=1)) \
+                          .rank(ascending=False, method="first").astype("float32")
+        g = df.groupby(RACE_KEYS)[col]
+        mu = g.transform("mean").astype("float32")
+        sd = g.transform("std").astype("float32").replace(0, np.nan)
+        df[f"z_{col}"] = ((s - mu) / sd).astype("float32").fillna(0.0)
+        top = g.transform("max").astype("float32")
+        df[f"gap_{col}"] = (top - s).astype("float32")
+
+    # 総合順位 r_mean_all & 偏差値 dev_r_mean_all
+    r_cols_all = [c for c in df.columns if c.startswith("r_") and not c.startswith(("r_rank_","r_mean_","r_std_","r_dev_","r_top_","r_diff_","r_gap_","r_sp_rank_in_race"))]
+    if r_cols_all:
+        n_in_race = df.groupby(RACE_KEYS)["horse_number"].transform("count").astype("float32")
+        R = df[r_cols_all].astype("float32").values
+        R_rev = (n_in_race.values.reshape(-1,1) + 1.0) - R
+        df["r_mean_all"] = np.nanmean(R_rev, axis=1).astype("float32")
+        g = df.groupby(RACE_KEYS)["r_mean_all"]
+        mu = g.transform("mean").astype("float32")
+        sd = g.transform("std").astype("float32").replace(0, np.nan)
+        df["dev_r_mean_all"] = (50.0 + 10.0 * (df["r_mean_all"] - mu) / sd).astype("float32").fillna(50.0)
+
+    # --- 5) Soft-Finish 補助特徴の付与（学習済みモデル + winsorize） ---
+    sf_meta = meta.get("soft_finish", {})
+    need_sf = ("feat_soft_finish" in FEATURES_C)
+    sf_ok = False
+
+    if sf_meta and os.path.exists(sf_model_path):
+        try:
+            sf_feats    = [c for c in sf_meta.get("feature_cols", []) if c in df.columns]
+            sf_cat_map  = dict(sf_meta.get("cat_categories", {}))
+            sf_wins     = sf_meta.get("winsor", {"lo": -np.inf, "hi": np.inf})
+            lo, hi      = float(sf_wins.get("lo", -np.inf)), float(sf_wins.get("hi", np.inf))
+
+            # 学習時カテゴリを強制適用（未知は "__NA__"）
+            for c, cats in sf_cat_map.items():
+                if c in df.columns:
+                    cats = [str(x) for x in cats]
+                    s = df[c].astype("string").fillna("__NA__")
+                    s = s.where(s.isin(cats), "__NA__")
+                    df[c] = pd.Categorical(s, categories=cats)
+
+            # 予測（Booster.predict を DataFrame 直渡し）
+            sf_booster = lgb.Booster(model_file=sf_meta.get("model_path", sf_model_path))
+            sf_pred    = sf_booster.predict(df[sf_feats], num_iteration=int(sf_meta.get("num_boost_round", -1)))
+            sf_pred    = np.asarray(sf_pred, dtype="float32")
+            df["feat_soft_finish"] = np.clip(sf_pred, lo, hi).astype("float32")
+            sf_ok = True
+            print(f"  - Soft-Finish 特徴 'feat_soft_finish' を付与（winsor: lo={lo:.4f}, hi={hi:.4f}）")
+        except Exception as e:
+            print(f"  - [WARN] Soft-Finish 推論に失敗: {e}")
+
+    if need_sf and not sf_ok:
+        df["feat_soft_finish"] = 0.0
+        print("  - [SAFE] Soft-Finishが利用できないため 'feat_soft_finish'=0.0 を代入（最小限動作）")
+
+    # --- 6-0) Stage-C 本体：学習時カテゴリ全集合を today に強制適用（任意の保存があれば） ---
+    if CAT_MAP_C:
+        applied = 0
+        for c, cats in CAT_MAP_C.items():
+            if c in df.columns:
+                cats = [str(x) for x in cats]
+                s = df[c].astype("string").fillna("__NA__")
+                s = s.where(s.isin(cats), "__NA__")
+                df[c] = pd.Categorical(s, categories=cats)
+                applied += 1
+        if applied:
+            print(f"  - Stage-C 学習カテゴリを強制適用: {applied} 列")
+
+    # --- 6) 最終入力 X の作成（契約どおりの FEATURES / カテゴリ型） ---
+    missing = [c for c in FEATURES_C if c not in df.columns]
+    if missing:
+        raise ValueError(f"[契約違反] Stage-C 必要特徴が today 入力にありません: {missing[:20]}{' ...' if len(missing)>20 else ''}")
+
+    Xc = df[FEATURES_C].copy()
+
+    # カテゴリ列を category に強制
+    cat_found = [c for c in CAT_FEATURES_C if c in Xc.columns]
+    for c in cat_found:
+        if str(Xc[c].dtype) != "category":
+            Xc[c] = Xc[c].astype("string").fillna("__NA__").astype("category")
+
+    # --- 7) 本体予測 → レース内 softmax（温度T） ---
+    raw_logit = booster.predict(Xc, num_iteration=BEST_ITER if BEST_ITER > 0 else -1, raw_score=True)
+    raw_logit = np.asarray(raw_logit, dtype="float64")
+
+    # group id by (date, race_code)
+    gids = df[["date","race_code"]].agg(tuple, axis=1).values
+    _, gid = np.unique(gids, return_inverse=True)
+
+    def _softmax_by_group(zlogit: np.ndarray, gid: np.ndarray, T: float) -> np.ndarray:
+        eps = 1e-15
+        z = zlogit / max(T, eps)
+        gmax = np.full(gid.max()+1, -np.inf, dtype=np.float64)
+        np.maximum.at(gmax, gid, z)
+        ex = np.exp(z - gmax[gid])
+        gsum = np.zeros_like(gmax)
+        np.add.at(gsum, gid, ex)
+        p = ex / np.clip(gsum[gid], eps, None)
+        return np.clip(p, eps, 1.0 - eps)
+
+    T = float(TEMP_SOFTMAX) if np.isfinite(TEMP_SOFTMAX) and TEMP_SOFTMAX > 0 else 1.0
+    df["pred_win_prob"] = _softmax_by_group(raw_logit, gid, T=T).astype("float32")
+    print(f"  - レース内 softmax を適用（温度 T={T:.4f}）。'pred_win_prob' を追加。")
+
+    # --- 8) 最小派生成果物を保存（任意） ---
+    try:
+        MERGE_KEYS = ["date","race_code","horse_number"]
+        if all(k in df.columns for k in MERGE_KEYS):
+            out = df[MERGE_KEYS + ["pred_win_prob"]].copy()
+            out["race_code"] = out["race_code"].map(_to11).astype("string")
+            out.to_parquet(derived_save_path, index=False, engine="pyarrow", compression="zstd")
+            print(f"  ✅ Stage-C 予測の最小派生を保存: {derived_save_path} rows={len(out):,}")
+    except Exception as e:
+        print(f"  - [WARN] Stage-C 派生の保存に失敗: {e}")
+
+    print(f"  ✅ Stage-C 予測完了。データ形状: {df.shape}")
+    return df
+
+
+# ────────────────────────────────────────────────
+# Cell-RUN : Main（順次実行 → CSV保存）  ※汎用ランナー削除版
+# ────────────────────────────────────────────────
+def main():
+    print("=== JRA06 Stage-Today ===")
+
+    # 1) BASE 前処理
+    df_feat, df_id = preprocess_today_data(PATH_TODAY_DATA_CSV, J2E_JSON_PATH, AGGREGATION_TARGET_COLS)
+
+    # 2) CAND
+    df_cand = run_stage_cand(df_feat)
+    log(f"Stage-CAND done: {df_cand.shape}")
+
+    # 3) 連結して SP 入力を作成
+    df_all = pd.concat([df_feat.reset_index(drop=True), df_cand.reset_index(drop=True)], axis=1)
+
+    # 4) SP（専用 today 推論：カテゴリ/頻度/列順再現→log1p逆変換→派生まで）
+    df_all = predict_and_derive_sp_features(
+        df_all,
+        model_path=SP_MODEL_PATH,
+        sp_unified_meta_path=SP_UNIFIED_META_PATH,
+        sp_general_meta_path=SP_META_PATH,
+        sp_schema_path=SP_SCHEMA_PATH,
+        save_minimal_artifact=True
+    )
+    log("Stage-SP done: pred_time_index_sp & race-internal features added")
+
+    # 5) A（専用 today 推論：学習契約を忠実再現→温度スケーリング→派生まで）
+    df_all = predict_and_derive_stage_a_features(
+        df_all,
+        model_path=STAGE_A_MODEL_PATH,
+        meta_path=STAGE_A_META_PATH,
+        stage_a_cat_meta_path=STAGE_A_CAT_META_PATH,
+        stage_a_schema_path=STAGE_A_SCHEMA_PATH
+    )
+    log("Stage-A done: pred_prob_stage_a & A-derivatives added")
+
+    # 6) B（専用 today 推論：学習契約を忠実再現→CAP→Isotonic校正（あれば））
+    try:
+        iso_path_b = STAGE_B_ISO_PATH  # 任意（定義が無ければ下の except で None）
+    except NameError:
+        iso_path_b = None
+
+    df_all = predict_stage_b(
+        df_all,
+        model_path=STAGE_B_MODEL_PATH,
+        meta_path=STAGE_B_META_PATH,
+        iso_path=iso_path_b
+    )
+    log("Stage-B done: pred_ev_stage_b (+cal if available) added")
+
+    # 7) C（専用 today 推論：学習契約を忠実再現→Soft-Finish→softmax(T)）
+    #    ※ 定義が無い場合は既定パスへフォールバック
+    try:
+        _STAGE_C_DIR = STAGE_C_DIR
+    except NameError:
+        _STAGE_C_DIR = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_c")
+    os.makedirs(_STAGE_C_DIR, exist_ok=True)
+
+    try:
+        stage_c_model_path = STAGE_C_MODEL_PATH
+    except NameError:
+        stage_c_model_path = os.path.join(_STAGE_C_DIR, "JRA_stage_c_model.txt")
+
+    try:
+        stage_c_meta_path = STAGE_C_META_PATH
+    except NameError:
+        stage_c_meta_path = os.path.join(_STAGE_C_DIR, "JRA_stage_c_meta.json")
+
+    try:
+        stage_c_sf_model_path = STAGE_C_SF_MODEL_PATH
+    except NameError:
+        stage_c_sf_model_path = os.path.join(_STAGE_C_DIR, "JRA_stage_c_softfinish_model.txt")
+
+    try:
+        stage_b_meta_path = STAGE_B_META_PATH
+    except NameError:
+        stage_b_meta_path = os.path.join(ARTIFACTS_BASE_DIR, "artifacts_stage_b", "JRA_stage_b_meta.json")
+
+    stage_c_derived_path = os.path.join(_STAGE_C_DIR, "JRA_derived_features_from_stage_c.parquet")
+
+    df_all = predict_stage_c_today(
+        df_all,
+        model_path=stage_c_model_path,
+        meta_path=stage_c_meta_path,
+        sf_model_path=stage_c_sf_model_path,
+        stage_b_meta_path=stage_b_meta_path,
+        derived_save_path=stage_c_derived_path
+    )
+    log("Stage-C done: pred_win_prob added")
+
+
+if __name__ == "__main__":
+    main()
+
+# ──────────────────────────────────────────────────────────────
+# Cell-6 : 最終結果のCSV出力（JRA06｜CAND & C を追加）
+# ──────────────────────────────────────────────────────────────
+
+import re
+import pathlib
+
+# ★★★ 学習時と同様のゼロパディング関数 ★★★
+def _to_11str(x):
+    """race_codeを11桁のゼロ埋め文字列に正規化する"""
+    if pd.isna(x):
+        return None
+    s = str(x)
+    s = re.sub(r"\.0$", "", s)
+    return s.zfill(11)
+
+def generate_final_output(df_b_data, df_identifiers, output_path):
+    """
+    最終的な予測結果を識別子とマージし、指定された形式でCSVファイルに出力する。
+    ※ JRA06 では JRA04 の3ステージに加えて、CAND と C（単勝）を1列ずつ追加します。
+    """
+    if df_b_data is None or len(df_b_data) == 0:
+        raise ValueError("df_b_data が空です。Stage-Today の前段処理を確認してください。")
+    if df_identifiers is None or len(df_identifiers) == 0:
+        raise ValueError("df_identifiers が空です。識別子の作成手順を確認してください。")
+
+    print("\n◎◎◎ ステップ5: 最終結果のCSV出力を開始 ◎◎◎")
+
+    # --- 1. 最終データと識別子のマージ（厳格チェック） ---
+    merge_keys = ['date', 'race_code', 'race_number', 'horse_number']
+    for k in merge_keys:
+        if k not in df_b_data.columns:
+            raise KeyError(f"df_b_data に必要キー列がありません: '{k}'")
+        if k not in df_identifiers.columns:
+            raise KeyError(f"df_identifiers に必要キー列がありません: '{k}'")
+
+    df_out = pd.merge(df_b_data, df_identifiers, on=merge_keys, how='left', validate='m:1')
+    print(f"  - 予測結果と識別子をマージしました。 Shape: {df_out.shape}")
+
+    # ★★★ 最終出力のrace_codeをゼロパディング ★★★
+    if 'race_code' in df_out.columns:
+        df_out['race_code'] = df_out['race_code'].apply(_to_11str)
+        print("  - [同型化] race_codeを11桁ゼロ埋め文字列に正規化しました。")
+
+    # --- 2. 出力する列を指定（各ステージ1列） ---
+    output_cols = [
+        'date',
+        'race_code',
+        'race_number',
+        'horse_number',
+        'keep_prob_in3',      # Stage-CAND: 主要出力
+        'pred_time_index_sp', # Stage-SP: 予想time指数
+        'pred_prob_stage_a',  # Stage-A: 予想複勝確率
+        'pred_payout_blend',  # Stage-B: 予想複勝配当（学習時CAP適用後）
+        'pred_win_prob'       # Stage-C: 温度較正後の単勝確率
+    ]
+
+    missing_cols = [c for c in output_cols if c not in df_out.columns]
+    if missing_cols:
+        # 必須列が無ければ停止（サイレント破壊を防止）
+        raise KeyError(f"最終出力に必要な列が見つかりません: {missing_cols}")
+
+    df_final = df_out[output_cols]
+    print(f"  - 出力する列を{len(output_cols)}個に確定しました。")
+
+    # --- 3. CSVファイルへの出力 ---
+    try:
+        pathlib.Path(os.path.dirname(output_path)).mkdir(parents=True, exist_ok=True)
+        df_final.to_csv(output_path, index=False, encoding='utf-8-sig')
+        print(f"  ✅ 最終予測結果をCSVファイルに出力しました。")
+        print(f"     - Path: {output_path}")
+        print(f"     - Shape: {df_final.shape}")
+    except Exception as e:
+        raise RuntimeError(f"CSVファイルの出力に失敗しました: {e}")
+
+    return df_final
+
