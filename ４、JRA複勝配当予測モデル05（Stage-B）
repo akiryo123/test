@@ -173,36 +173,37 @@ print(f"\n--- Cell-3: 時系列分割を開始 ---")
 df_sorted = df.sort_values("date").reset_index(drop=True)
 del df; gc.collect()
 
-TRAIN_START_DATE = pd.to_datetime("2020-01-01")  # 時短モード
-# TRAIN_START_DATE = pd.to_datetime("2016-01-01")
+#TRAIN_START_DATE = pd.to_datetime("2020-01-01")  # 時短モード！！！！！！！！！！！！！！！！
+TRAIN_START_DATE = pd.to_datetime("2016-01-01")
 VALID_START_DATE = pd.to_datetime("2023-04-01")
 VALID_END_DATE   = pd.to_datetime("2024-03-31")
 TEST_START_DATE  = pd.to_datetime("2024-04-01")
-TEST_END_DATE    = pd.to_datetime("2025-07-31")
+TEST_END_DATE    = pd.to_datetime("2025-08-31")
 TRAIN_END_DATE   = VALID_START_DATE - pd.Timedelta(days=1)
 
 train = df_sorted[(df_sorted["date"] >= TRAIN_START_DATE) & (df_sorted["date"] <= TRAIN_END_DATE)].copy()
 valid = df_sorted[(df_sorted["date"] >= VALID_START_DATE) & (df_sorted["date"] <= VALID_END_DATE)].copy()
-test  = df_sorted[df_sorted["date"] >= TEST_START_DATE].copy()
+test = df_sorted[(df_sorted["date"] >= TEST_START_DATE) & (df_sorted["date"] <= TEST_END_DATE)].copy()
 del df_sorted; gc.collect()
 
 # ★★★分割後の空チェック ★★★
 assert not train.empty and not valid.empty and not test.empty, "データ分割後、いずれかのセットが空になりました。日付範囲を確認してください。"
 
-print(f"   - 学習データ (Train): {len(train):,}行")
-print(f"   - 検証データ (Valid): {len(valid):,}行")
-print(f"   - テストデータ (Test):  {len(test):,}行")
+print(f"  - 学習データ (Train): {train['date'].min().strftime('%Y-%m-%d')} ~ {train['date'].max().strftime('%Y-%m-%d')} ({len(train)}行)")
+print(f"  - 検証データ (Valid): {valid['date'].min().strftime('%Y-%m-%d')} ~ {valid['date'].max().strftime('%Y-%m-%d')} ({len(valid)}行)")
+print(f"  - テストデータ (Test):  {test['date'].min().strftime('%Y-%m-%d')} ~ {test['date'].max().strftime('%Y-%m-%d')} ({len(test)}行)")
 print("--- Cell-3: 完了 ---")
 
-# === CAND hard filter (Cell-3: split直後) ===
-before = len(train)
-mask = np.ones(before, dtype=bool)
+# === CAND hard filter (Train “only mark”, don’t drop) ===
+train['cand_drop_flag'] = 0
 if 'exclude_flag_095' in train.columns:
-    mask &= (train['exclude_flag_095'] != 1)
+    train.loc[train['exclude_flag_095'] == 1, 'cand_drop_flag'] = 1
 if 'bottom3_by_cand' in train.columns:
-    mask &= (train['bottom3_by_cand'] != 1)
-train = train.loc[mask].reset_index(drop=True)
-print(f"[CAND-FILTER] Train-only filter: removed {before-len(train):,}/{before:,}")
+    train.loc[train['bottom3_by_cand'] == 1, 'cand_drop_flag'] = 1
+# ※学習時は除外せず down-weight のみ行うため文言を更新
+print(f"[CAND-FILTER] Train-only mark: will down-weight {train['cand_drop_flag'].sum():,} rows *only in fitting*.")
+valid['cand_drop_flag'] = 0
+test['cand_drop_flag']  = 0
 # === end ===
 
 
@@ -238,7 +239,8 @@ print("   - ベースの目的変数 'target_raw' を作成しました（CAND�
 
 # 2) CAP（上限）を train の target_raw 分布から決定
 cap_ser = train['target_raw'].dropna()
-_auto_cap  = int(np.nanquantile(cap_ser, 0.995)) if len(cap_ser) else 1000
+# ▼ (3) CAP分位 0.995 → 0.99 へ
+_auto_cap  = int(np.nanquantile(cap_ser, 0.99)) if len(cap_ser) else 1000
 PAYOUT_CAP = int(min(1000, max(0, _auto_cap)))   # 安全上限は 1000 円にクリップ
 print(f"   - CAP算出: auto={_auto_cap} → 使用CAP={PAYOUT_CAP} 円")
 
@@ -255,8 +257,8 @@ def apply_cand_near_miss(df_input: pd.DataFrame, payout_cap: int) -> pd.DataFram
     else:
         nm = pd.Series(0.2, index=df.index, dtype='float32')
 
-    # 例: CAP の 10% をベースに、CAND で 0.5〜1.5 倍のレンジへ
-    nm_score_all = (payout_cap * 0.10 * (0.5 + nm)).astype('float32')
+    # ▼ (3) near-miss 係数 0.10 → 0.06 に調整
+    nm_score_all = (payout_cap * 0.06 * (0.5 + nm)).astype('float32')
     df.loc[miss_mask, 'target_raw'] = nm_score_all.loc[miss_mask]
     return df
 
@@ -283,27 +285,25 @@ print(f"\n--- Cell-5: 特徴量エンジニアリング & データセット作�
 
 import gc
 
-# ★★★【パッチ修正】ログ文言をより正確に ★★★
 print("[INFO] 学習は train+valid、評価/可視化で test も使用します。")
 train_mix = train.copy(); valid_mix = valid.copy(); test_mix  = test.copy()
 print(f"   - モデル学習用のデータを作成しました (Train={len(train_mix):,}行, Valid={len(valid_mix):,}行, Test={len(test_mix):,}行)")
 
-combined_for_encoding = pd.concat([train_mix, valid_mix], ignore_index=True)
-print(f"   - 頻度エンコード用の結合データを作成しました: {combined_for_encoding.shape}")
+# ★★★ [NO-LEAK] 頻度エンコードの母集団は train のみ ★★★
+# ▼ (6) encoding_base は “除外なしの train 全体” に変更
+encoding_base = train.copy()
+print(f"   - [NO-LEAK] 頻度エンコード用の母集団 = train のみ: {encoding_base.shape}")
 
 LEAK_COLS = [
     "place_payout", "finishing_position", "win_payout", "time_index",
     "place_odds_1", "place_odds_1_clipped",
     "jockey_trainer_combo","trainer_owner_combo","jockey_owner_combo",
-#    "implied_place_odds","implied_win_odds",
-#    "trifecta_support_rate","implied_prob_place_tri",
     "target_raw", TARGET_CAPPED
 ]
-# === ここから追加（Cell-5: LEAK_COLS 定義のすぐ下あたり） ===
-LEAK_COLS.extend([c for c in ["sample_weight_cand", "exclude_flag_095", "bottom3_by_cand"] if c in train_mix.columns])
-# === ここまで追加 ===
+# CAND関連で学習に使わない“指示系”列は除外（あれば）
+LEAK_COLS.extend([c for c in ["sample_weight_cand", "exclude_flag_095", "bottom3_by_cand", "cand_drop_flag"] if c in train_mix.columns])
 
-OLD_ODDS_FEATURES = ['ev_raw', 'ev_pct','kelly_raw', 'kelly_clip'] #, 'prob_gap_stage_a', 'implied_prob_place'
+OLD_ODDS_FEATURES = ['ev_raw', 'ev_pct','kelly_raw', 'kelly_clip']
 LEAK_COLS.extend(OLD_ODDS_FEATURES)
 LEAK_COLS = sorted(set([c for c in LEAK_COLS if c in train_mix.columns]))
 
@@ -320,7 +320,9 @@ cat_cols_all = [c for c in FEATURES if _is_categorical(train_mix[c])]
 print(f"   - 一次カテゴリ候補: {len(cat_cols_all)} 列")
 
 ALWAYS_HIGH_CARD = [c for c in ["owner_name", "breeder_name", "bloodline1", "bloodline5", "birthplace"] if c in cat_cols_all]
-HIGH_CARD_THRESHOLD = 200
+# ▼ (6) 高カーデ閾値 200 → 150
+HIGH_CARD_THRESHOLD = 150
+# ★ カーディナリティ判定も train のみ
 cardinality = {c: train_mix[c].nunique(dropna=False) for c in cat_cols_all}
 high_card_auto = [c for c in cat_cols_all if cardinality.get(c, 0) > HIGH_CARD_THRESHOLD]
 high_card_cols = sorted(list(set(ALWAYS_HIGH_CARD + high_card_auto)))
@@ -329,6 +331,7 @@ for c, k in sorted(cardinality.items(), key=lambda x: -x[1])[:10]:
     print(f"      {c:24s}: {k}")
 print(f"   - 高カーデ判定（閾値 {HIGH_CARD_THRESHOLD}）: {high_card_cols}")
 
+# === 頻度エンコード（train-onlyで学習→全データに適用）===
 freq_maps = {}
 def _add_freq_feature(col: str, mapping: pd.Series):
     new_col = f"{col}_freq"
@@ -337,17 +340,19 @@ def _add_freq_feature(col: str, mapping: pd.Series):
         df_[new_col] = ser.map(mapping).astype("float32").fillna(0.0)
 
 for col in high_card_cols:
-    if col not in combined_for_encoding.columns:
-        print(f"   - 警告: 高カーデ列 '{col}' が combined に見つかりません。スキップ。")
+    if col not in encoding_base.columns:
+        print(f"   - 警告: 高カーデ列 '{col}' が train に見つかりません。スキップ。")
         continue
-    ser_all = combined_for_encoding[col].astype(str)
-    vc_ratio = (ser_all.value_counts(dropna=False) / len(ser_all)).astype("float32")
+    # ★★★ [NO-LEAK] train のみで頻度（割合）を推定
+    ser_train = encoding_base[col].astype(str)
+    vc_ratio = (ser_train.value_counts(dropna=False) / len(ser_train)).astype("float32")
     freq_maps[col] = {str(k): float(v) for k, v in vc_ratio.items()}
     _add_freq_feature(col, vc_ratio)
-    print(f"   - 頻度エンコード '{col}_freq' を付与（割合スケール, unique={len(vc_ratio)}）")
+    print(f"   - [NO-LEAK] 頻度エンコード '{col}_freq' を付与（train比率, unique={len(vc_ratio)}）")
 
 high_card_freq_cols = [f"{c}_freq" for c in high_card_cols if f"{c}_freq" in train_mix.columns]
 
+# === 低カーデ列の希少統合（しきい値は train ベース）===
 RARE_MIN_COUNT = 50
 cat_cols_small = [c for c in cat_cols_all if c not in high_card_cols]
 for col in cat_cols_small:
@@ -359,11 +364,13 @@ for col in cat_cols_small:
         ser = ser.where(ser.isin(keep_vals_str), '___RARE___')
         df_[col] = ser
 
+# カテゴリ型（train の辞書で固定）
 for col in cat_cols_small:
     cats = sorted(set(train_mix[col].unique().tolist() + ['___RARE___']))
     for df_ in (train_mix, valid_mix, test_mix):
         df_[col] = pd.Categorical(df_[col], categories=cats)
 
+# 高カーデの元カテゴリ列は落として *_freq を採用
 FEATURES = [c for c in FEATURES if c not in high_card_cols]
 FEATURES += high_card_freq_cols
 FEATURES = sorted(list(dict.fromkeys(FEATURES)))
@@ -380,6 +387,7 @@ for col in cat_cols:
             df_[col] = df_[col].astype('category')
 print("   - カテゴリ型の最終整形が完了しました。")
 
+# === メタ保存（train-onlyの周知を含む）===
 cat_meta = {col: list(train_mix[col].cat.categories.astype(str)) for col in cat_cols}
 try:
     with open(CAT_META_PATH_B, "w", encoding="utf-8") as f:
@@ -393,10 +401,11 @@ stage_b_meta = {
     "high_card_cols": high_card_cols,
     "cat_cols":       cat_cols,
     "categories":     cat_meta,
-    "freq_maps":      freq_maps,
+    "freq_maps":      freq_maps,            # train-only
     "high_card_threshold": HIGH_CARD_THRESHOLD,
     "rare_min_count": RARE_MIN_COUNT,
-    "payout_cap":     _payout_cap
+    "payout_cap":     _payout_cap,
+    "freq_maps_source": "train_only"        # ★ 監査用フラグ
 }
 schema = {
     "dtypes": {},
@@ -452,10 +461,11 @@ print(f"   - 互換用 df_all を準備しました: {df_all.shape} （train+val
 if DF_ALL_SLIM:
     print(f"   - [メモリ節約] df_all を必要列（{len(keep_cols)}列）のみにスリム化しました。")
 
-del combined_for_encoding
+del encoding_base
 gc.collect()
 
 print("--- Cell-5: 完了 ---")
+
 
 # ────────────────────────────────────────────────
 # Cell-6 : LightGBMモデル学習 (v3仕様・カテゴリ正則化強化 / L2) [RAM節約版]
@@ -464,20 +474,35 @@ print(f"--- Cell-6: LightGBMモデル学習 (v3仕様・カテゴリ正則化強
 
 # === 安全な重み作成関数（CAND由来） ===
 def make_weights(df_sub: pd.DataFrame) -> np.ndarray:
-    # 1) keep_prob_in3 を非線形に（上位をやや強調）
-    if "keep_prob_in3" in df_sub.columns:
-        km = df_sub["keep_prob_in3"].astype("float32").clip(0, 1).fillna(0.5)
-        w = (0.6 + 2.0 * (km ** 1.5)).astype("float32")
+    # ▼ (1) keep_prob_in3 を“やや強調（抑えめ）”
+    km = df_sub.get("keep_prob_in3")
+    if km is not None:
+        km = km.astype("float32").clip(0, 1).fillna(0.5)
+        w = (0.8 + 1.5 * (km ** 1.25)).astype("float32")
     else:
         w = np.ones(len(df_sub), dtype="float32")
+
     # 2) ボトム印は弱める
     if "bottom3_by_cand" in df_sub.columns:
-        w *= np.where(df_sub["bottom3_by_cand"] == 1, 0.7, 1.0).astype("float32")
-    # 3) 安全クリップ
+        w *= np.where(df_sub["bottom3_by_cand"] == 1, 0.6, 1.0).astype("float32")
+
+    # 3) cand_drop_flag も“弱める”（除外はしない）
+    if "cand_drop_flag" in df_sub.columns:
+        w *= np.where(df_sub["cand_drop_flag"] == 1, 0.5, 1.0).astype("float32")
+
+    # 4) レース内で平均=1に正規化（分布の偏り抑制）
+    if {"date","race_code"}.issubset(df_sub.columns):
+        w_ser = pd.Series(w, index=df_sub.index)
+        grp_mean = w_ser.groupby([df_sub["date"], df_sub["race_code"]]).transform("mean").clip(lower=1e-3)
+        w = (w_ser / grp_mean).astype("float32").values
+
+    # 5) 安全クリップ
     return np.clip(w, 0.3, 3.0)
 
 # === インデックスとスライス ===
 tr_idx = np.array(train_idx); va_idx = np.array(valid_idx)
+
+# ▼ (1) 物理除外 row_keep を撤廃し、全件を使用
 y_tr = df_all.loc[tr_idx, TARGET_CAPPED].astype(float).values
 y_va = df_all.loc[va_idx, TARGET_CAPPED].astype(float).values
 X_tr = df_all.loc[tr_idx, feature_cols]
@@ -496,23 +521,23 @@ params = {
     "boosting_type": "gbdt",
     "seed": SEED,
 
-    # 容量アップ & 低LRで丁寧に
+    # ▼ (5) 容量/正則化を見直し
     "learning_rate": 0.02,
-    "num_leaves": 256,
-    "min_data_in_leaf": 96,
+    "num_leaves": 384,        # 256 → 384
+    "min_data_in_leaf": 80,   # 96  → 80
 
     # サンプリングを少し緩めてバイアス低減
     "feature_fraction": 0.90,
     "bagging_fraction": 0.90,
     "bagging_freq": 1,
 
-    # 正則化はL2をやや強めに
+    # 正則化（やや緩める）
     "lambda_l1": 0.0,
-    "lambda_l2": 5.0,
+    "lambda_l2": 3.0,         # 5.0 → 3.0
     "min_gain_to_split": 0.0,
 
-    # ヒスト/構築まわり（メモリ見合いで調整可）
-    "max_bin": 127,
+    # ヒスト/構築まわり
+    "max_bin": 255,           # 127 → 255
     "min_data_in_bin": 5,
     "force_col_wise": True,
     "two_round": True,
@@ -539,7 +564,8 @@ params = {
 # === 次にモノトニック制約（安全な最小セットのみ）を準備・付与 ===
 mono = []
 POS_MONO = {"keep_prob_in3", "pred_prob_stage_a"}  # ↑であるほどEV↑を期待
-NEG_MONO = {"exclude_margin_090", "exclude_margin_095", "cand_bad_z"}  # ↑であるほどEV↓を期待
+# ▼ (7) NEG_MONO に cand_bad_gap を追加
+NEG_MONO = {"exclude_margin_090", "exclude_margin_095", "cand_bad_z", "cand_bad_gap"}  # ↑であるほどEV↓
 
 for c in feature_cols:
     if c in POS_MONO:
@@ -552,7 +578,7 @@ for c in feature_cols:
 # 整合性チェック & 付与
 assert len(mono) == len(feature_cols), "monotone_constraints の長さが feature_cols と一致していません。"
 params["monotone_constraints"] = mono
-params["monotone_constraints_method"] = "advanced"
+params["monotone_constraints_method"] = "basic"
 
 # ログ
 print(f"[INFO] Monotone constraints: +1={mono.count(1)}, -1={mono.count(-1)}, 0={mono.count(0)}")
@@ -595,6 +621,7 @@ gc.collect()
 
 print("\n[INFO] TrainデータとValidデータを結合して最終モデルを再学習します...")
 trva_idx = np.r_[tr_idx, va_idx]
+# ▼ (1) 物理除外を行わず全件で再学習（重みで抑制）
 X_trva = df_all.loc[trva_idx, feature_cols]
 y_trva = df_all.loc[trva_idx, TARGET_CAPPED].astype(float).values
 w_trva = make_weights(df_all.loc[trva_idx])
@@ -647,15 +674,26 @@ print('--- Cell-6: 完了 ---')
 
 
 # ────────────────────────────────────────────────
-# Cell-7 : モデル評価（リンク関数=恒等（raw_score=False）/CAPクリップ）
+# Cell-7 : モデル評価（リンク関数=恒等 / CAPクリップ / Isotonic校正）
 # ────────────────────────────────────────────────
 print('--- Cell-7: モデル評価を開始 ---')
 
+# ===== 0) 準備・ユーティリティ =====
 stage_b_dir = ART_DIR_B if 'ART_DIR_B' in globals() else "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_b"
 model_path   = os.path.join(stage_b_dir, "JRA_stage_b_model.pkl")
 CAP          = float(locals().get("PAYOUT_CAP", 1000))
-BEST_ITER    = None
 
+def _metric(y, p):
+    r2  = r2_score(y, p)
+    mae = mean_absolute_error(y, p)
+    rmse = np.sqrt(mean_squared_error(y, p))
+    return r2, mae, rmse
+
+def _describe(name, x):
+    q = np.quantile(x, [0, .5, .9, .99, 1.0])
+    print(f"[{name}] min={q[0]:.3f}, p50={q[1]:.3f}, p90={q[2]:.3f}, p99={q[3]:.3f}, max={q[4]:.3f}")
+
+# モデル読み出し
 try:
     model = gbm_final
     BEST_ITER = best_iter if 'best_iter' in globals() else getattr(model, 'best_iteration', None)
@@ -664,6 +702,20 @@ except NameError:
     model = lgb.Booster(model_file=model_path)
     BEST_ITER = getattr(model, 'best_iteration', None)
 
+# BEST_ITER セーフティ
+if BEST_ITER is None:
+    if hasattr(model, "current_iteration") and model.current_iteration() is not None:
+        BEST_ITER = model.current_iteration()
+    else:
+        BEST_ITER = -1  # LightGBM 側で「最後まで」使う
+
+# 予測（CAP域へ）
+def _predict_ev(_X):
+    pred = model.predict(_X, num_iteration=BEST_ITER, raw_score=False)
+    out = np.nan_to_num(pred, nan=0.0, posinf=CAP, neginf=0.0)
+    return np.clip(out, 0.0, CAP)
+
+# ===== 1) データ抽出 =====
 tr_idx = np.array(train_idx); va_idx = np.array(valid_idx); te_idx = np.array(test_idx)
 X_tr = df_all.loc[tr_idx, feature_cols]
 X_va = df_all.loc[va_idx, feature_cols]
@@ -673,130 +725,179 @@ y_tr = df_all.loc[tr_idx, TARGET_CAPPED].astype(float).values
 y_va = df_all.loc[va_idx, TARGET_CAPPED].astype(float).values
 y_te = df_all.loc[te_idx, TARGET_CAPPED].astype(float).values
 
-def _predict_ev(_X):
-    pred = model.predict(_X, num_iteration=BEST_ITER, raw_score=False)
-    out = np.nan_to_num(pred, nan=0.0, posinf=CAP, neginf=0.0)
-    return np.clip(out, 0.0, CAP)
+# ===== 2) 生予測（raw） =====
+pred_tr = _predict_ev(X_tr)
+pred_va = _predict_ev(X_va)
+pred_te = _predict_ev(X_te)
 
-pred_tr = _predict_ev(X_tr); pred_va = _predict_ev(X_va); pred_te = _predict_ev(X_te)
-
-
-# --- Cell-7：pred_* 作成直後に追加 ---
+# ===== 3) Isotonic 校正（年別OOFで学習 → クリップ） =====
 from sklearn.isotonic import IsotonicRegression
+import pickle as pkl
 
-# 学習用（Train+Valid）で単調キャリブレーション
-pred_trva = np.concatenate([pred_tr, pred_va])
-y_trva    = np.concatenate([y_tr,    y_va   ])
-iso = IsotonicRegression(out_of_bounds="clip")
-iso.fit(pred_trva, y_trva)
+# OOF を train 期間（= VALID_START_DATE より前）内で作る
+dty = pd.to_datetime(df_all["date"])
+train_mask_oof = dty < pd.to_datetime(VALID_START_DATE)
+years_present = sorted(dty[train_mask_oof].dt.year.unique().tolist())
 
-# Testへ適用
-pred_te_cal = iso.predict(pred_te)
-pred_va_cal = iso.predict(pred_va)
+oof_pred_list = []
+oof_true_list = []
 
-# 評価を “生” と “後段補正後” の両方で表示（まずは比較）
-def _metric(y, p):  # 既存の _metric を流用
-    r2  = r2_score(y, p)
-    mae = mean_absolute_error(y, p)
-    rmse = np.sqrt(mean_squared_error(y, p))
-    return r2, mae, rmse
+first_year = int(min(years_present)) if years_present else None
+for y in years_present:
+    if y == first_year:
+        # 最初の年はそれ以前の履歴がないのでスキップ
+        continue
+    ts_y = pd.Timestamp(f"{y}-01-01")
+    te_y = pd.Timestamp(f"{y}-12-31")
 
-r2_va_c, mae_va_c, rmse_va_c = _metric(y_va, pred_va_cal)
-r2_te_c, mae_te_c, rmse_te_c = _metric(y_te, pred_te_cal)
-print(f"   - [Valid Cal] R2={r2_va_c:.4f}, MAE={mae_va_c:.4f}, RMSE={rmse_va_c:.4f}")
-print(f"   - [Test  Cal] R2={r2_te_c:.4f}, MAE={mae_te_c:.4f}, RMSE={rmse_te_c:.4f}")
+    tr_m = (dty < ts_y) & train_mask_oof
+    ho_m = (dty >= ts_y) & (dty <= te_y) & train_mask_oof
 
-# スコア列（df_all / valid / test系）も別名で保持
-df_all.loc[te_idx, 'pred_score_cal'] = pred_te_cal
-df_all.loc[va_idx, 'pred_score_cal'] = pred_va_cal
-# エクスポート側（Cell-11）で pred_score_cal も一緒に出すなら rename せず列追加のままでOK
-# --- end ---
+    if not ho_m.any():
+        continue
+    if tr_m.sum() < 100:  # 学習行が少なすぎる場合はスキップ
+        continue
 
+    X_tr_oof = df_all.loc[tr_m, feature_cols]
+    y_tr_oof = df_all.loc[tr_m, TARGET_CAPPED].astype(float).values
+    w_tr_oof = make_weights(df_all.loc[tr_m])
 
-def _metric(y, p):
-    r2  = r2_score(y, p)
-    mae = mean_absolute_error(y, p)
-    rmse = np.sqrt(mean_squared_error(y, p))
-    return r2, mae, rmse
+    X_ho_oof = df_all.loc[ho_m, feature_cols]
+    dtr_oof = lgb.Dataset(X_tr_oof, label=y_tr_oof, weight=w_tr_oof, categorical_feature=categorical_cols)
+    mdl_oof = lgb.train(params, dtr_oof, num_boost_round=int(BEST_ITER if BEST_ITER is not None else 200))
 
-# ★★★【パッチ修正】NameError回避のため、_describeの定義を呼び出しより前に移動 ★★★
-def _describe(name, x):
-    q = np.quantile(x, [0, .5, .9, .99, 1.0])
-    print(f"[{name}] min={q[0]:.3f}, p50={q[1]:.3f}, p90={q[2]:.3f}, p99={q[3]:.3f}, max={q[4]:.3f}")
+    ho_pred = mdl_oof.predict(X_ho_oof)
+    ho_pred = np.clip(np.nan_to_num(ho_pred, nan=0.0, posinf=CAP, neginf=0.0), 0, CAP).astype("float32")
+    ho_true = df_all.loc[ho_m, TARGET_CAPPED].astype(float).values
 
+    oof_pred_list.append(ho_pred)
+    oof_true_list.append(ho_true)
+
+# OOF が無ければフォールバック（Validのみ）
+if len(oof_pred_list) == 0:
+    print("[CAL] OOFが得られなかったため、ValidのみでIsotonicを学習します。")
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(pred_va, y_va)
+else:
+    oof_pred = np.concatenate(oof_pred_list)
+    oof_true = np.concatenate(oof_true_list)
+    iso = IsotonicRegression(out_of_bounds="clip")
+    iso.fit(oof_pred, oof_true)
+
+# 適用（CAPクリップ）
+pred_va_cal = np.clip(iso.predict(pred_va), 0.0, CAP)
+pred_te_cal = np.clip(iso.predict(pred_te), 0.0, CAP)
+
+# 保存＆メタ追記
+iso_path = os.path.join(stage_b_dir, "JRA_stage_b_iso.pkl")
+try:
+    with open(iso_path, "wb") as f:
+        pkl.dump(iso, f)
+    if 'stage_b_meta' in globals():
+        stage_b_meta['calibration'] = {"type": "isotonic_oof", "path": iso_path, "years": years_present}
+        with open(STAGE_B_META_PATH, "w", encoding="utf-8") as f:
+            json.dump(stage_b_meta, f, ensure_ascii=False, indent=2)
+    print(f"   - OOFベース校正器を保存しました: {iso_path}")
+except Exception as e:
+    print(f"[WARN] 校正器の保存に失敗: {e}")
+
+# ===== 4) メトリクス出力 =====
+# raw
 r2_tr,  mae_tr,  rmse_tr  = _metric(y_tr, pred_tr)
 r2_va,  mae_va,  rmse_va  = _metric(y_va, pred_va)
 r2_te,  mae_te,  rmse_te  = _metric(y_te, pred_te)
+
+# calibrated
+r2_va_c, mae_va_c, rmse_va_c = _metric(y_va, pred_va_cal)
+r2_te_c, mae_te_c, rmse_te_c = _metric(y_te, pred_te_cal)
+
 print(f"   - [Train(Mix)] R2={r2_tr:.4f}, MAE={mae_tr:.4f}, RMSE={rmse_tr:.4f}")
 print(f"   - [Valid(Mix)] R2={r2_va:.4f}, MAE={mae_va:.4f}, RMSE={rmse_va:.4f}")
 print(f"   - [Test(Mix)]  R2={r2_te:.4f}, MAE={mae_te:.4f}, RMSE={rmse_te:.4f}")
+print(f"   - [Valid Cal]  R2={r2_va_c:.4f}, MAE={mae_va_c:.4f}, RMSE={rmse_va_c:.4f}")
+print(f"   - [Test  Cal]  R2={r2_te_c:.4f}, MAE={mae_te_c:.4f}, RMSE={rmse_te_c:.4f}")
 
+# 参考：target_raw に対する一致（任意）
 try:
     y_te_raw = df_all.loc[te_idx, 'target_raw'].astype(float).values
-    r2_te_raw = r2_score(y_te_raw, pred_te)
-    mae_te_raw = mean_absolute_error(y_te_raw, pred_te)
-    rmse_te_raw = np.sqrt(mean_squared_error(y_te_raw, pred_te))
-    print(f"   - [Test vs target_raw] R2={r2_te_raw:.4f}, MAE={mae_te_raw:.4f}, RMSE={rmse_te_raw:.4f}")
+    r2_te_raw    = r2_score(y_te_raw, pred_te)
+    mae_te_raw   = mean_absolute_error(y_te_raw, pred_te)
+    rmse_te_raw  = np.sqrt(mean_squared_error(y_te_raw, pred_te))
+    r2_te_raw_c    = r2_score(y_te_raw, pred_te_cal)
+    mae_te_raw_c   = mean_absolute_error(y_te_raw, pred_te_cal)
+    rmse_te_raw_c  = np.sqrt(mean_squared_error(y_te_raw, pred_te_cal))
+    print(f"   - [Test vs target_raw] Raw R2={r2_te_raw:.4f}, MAE={mae_te_raw:.4f}, RMSE={rmse_te_raw:.4f}")
+    print(f"   - [Test vs target_raw] Cal R2={r2_te_raw_c:.4f}, MAE={mae_te_raw_c:.4f}, RMSE={rmse_te_raw_c:.4f}")
 except Exception as e:
     print(f"[WARN] target_raw評価の計算でエラー: {e}")
 
-df_all.loc[te_idx, 'pred_score'] = pred_te
-df_all.loc[va_idx, 'pred_score'] = pred_va
-test.loc[:, 'pred_score'] = pred_te
-valid.loc[:, 'pred_score'] = pred_va
+# ===== 5) スコア列の書き戻し（一貫してクリップ済みを利用） =====
+df_all.loc[va_idx, 'pred_score']      = pred_va
+df_all.loc[te_idx, 'pred_score']      = pred_te
+df_all.loc[va_idx, 'pred_score_cal']  = pred_va_cal
+df_all.loc[te_idx, 'pred_score_cal']  = pred_te_cal
+
+valid.loc[:, 'pred_score']     = pred_va
+test.loc[:,  'pred_score']     = pred_te
+valid.loc[:, 'pred_score_cal'] = pred_va_cal
+test.loc[:,  'pred_score_cal'] = pred_te_cal
 
 _describe("pred_te(EV円)", pred_te)
 
+# ===== 6) メトリクス保存 =====
 metrics_path = os.path.join(stage_b_dir, "JRA_stage_b_metrics.json")
 note = "objective=regression_l2 / link=identity(raw_score=False) / pred_scoreは元スケール[円]"
 with open(metrics_path, "w", encoding="utf-8") as f:
     json.dump({
-        "train": {"R2": float(r2_tr), "MAE": float(mae_tr), "RMSE": float(rmse_tr)},
-        "valid": {"R2": float(r2_va), "MAE": float(mae_va), "RMSE": float(rmse_va)},
-        "test":  {"R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)},
-        "note":  note
+        "train":     {"R2": float(r2_tr), "MAE": float(mae_tr), "RMSE": float(rmse_tr)},
+        "valid":     {"R2": float(r2_va), "MAE": float(mae_va), "RMSE": float(rmse_va)},
+        "test":      {"R2": float(r2_te), "MAE": float(mae_te), "RMSE": float(rmse_te)},
+        "valid_cal": {"R2": float(r2_va_c), "MAE": float(mae_va_c), "RMSE": float(rmse_va_c)},
+        "test_cal":  {"R2": float(r2_te_c), "MAE": float(mae_te_c), "RMSE": float(rmse_te_c)},
+        "note": note
     }, f, ensure_ascii=False, indent=2)
 print(f"\n   ✅ メトリクス保存: {metrics_path}")
 
-# ★★★【パッチ2 追加】パリティ監査用ファイルの出力 ★★★
+# ===== 7) Parity 出力（cal も同梱） =====
 print("\n[PARITY] Train-side parity export 開始")
 parity_dir = os.path.join(ART_DIR_B, "..", "parity")
 os.makedirs(parity_dir, exist_ok=True)
 
-def _to_11str(x):
-    if pd.isna(x): return None
-    s = str(x).split(".")[0]
-    return s.zfill(11)
-
-# ---- (1) prediction parity ----
+# (1) prediction parity
 parity_cols = ["date", "race_code", "race_number", "horse_number", "pred_score"]
+if "pred_score_cal" in test.columns:
+    parity_cols.append("pred_score_cal")
+
 df_parity = test.copy()
 if "date" in df_parity.columns:
     df_parity["date"] = pd.to_datetime(df_parity["date"]).dt.tz_localize(None)
 if "race_code" in df_parity.columns:
     df_parity["race_code"] = df_parity["race_code"].apply(_to_11str)
+
 parity_path = os.path.join(parity_dir, "stageb_test_pred_trainside.parquet")
 df_parity[parity_cols].to_parquet(parity_path, index=False)
 print(f"[PARITY] ✅ Train-side pred を保存しました: {parity_path} rows={len(df_parity):,}")
 
-# ---- (2) input parity (A_in) ----
+# (2) input parity (A_in)
 parity_input_path = os.path.join(parity_dir, "stageb_test_input_trainside.parquet")
 cols_out = ["date", "race_code", "race_number", "horse_number"] + list(feature_cols)
-# ★★★【エラー修正】重複列を削除してから保存 ★★★
 tmp_input = test_mix[cols_out]
 tmp_input = tmp_input.loc[:, ~tmp_input.columns.duplicated(keep='first')]
-
 if "race_code" in tmp_input.columns:
     tmp_input["race_code"] = tmp_input["race_code"].apply(_to_11str)
 tmp_input.to_parquet(parity_input_path, index=False)
 print(f"[PARITY] ✅ Train-side input saved: {parity_input_path} rows={len(tmp_input):,}, cols={len(tmp_input.columns)}")
-# ★★★【パッチ2 追加 ここまで】★★★
 
 print('--- Cell-7: 完了 ---')
 
-# ★ Cell-7 の最後に追加
+# ===== 8) メモリ解放 =====
 del X_tr, X_va, X_te, y_tr, y_va, y_te, pred_tr, pred_va
+try:
+    del pred_te_cal, pred_va_cal
+except:
+    pass
 gc.collect()
+
 
 # ────────────────────────────────────────────────
 # ★★★【コード追加】Cell-7.5 : 特徴量重要度の可視化 ★★★
@@ -826,7 +927,7 @@ print('--- Cell-7.5: 完了 ---')
 print(f"\n--- Cell-8: デシル分析を開始 ---")
 
 def decile_analysis_v3(df, score_col, payout_col, split_name):
-    df_analysis = df.copy() # ★★★【パッチ修正】コピーをここで作成 ★★★
+    df_analysis = df.copy()  # ★★★【パッチ修正】コピーをここで作成
 
     print(f"\n\n============================================================")
     print(f"   ● デシル分析: {split_name}")
@@ -837,7 +938,7 @@ def decile_analysis_v3(df, score_col, payout_col, split_name):
         return
 
     try:
-        # ★★★【パッチ修正】二重付与を解消し、ここで一度だけ実行 ★★★
+        # ★★★【パッチ修正】二重付与を解消し、ここで一度だけ実行
         df_analysis['decile'] = pd.qcut(df_analysis[score_col], 10, labels=False, duplicates='drop') + 1
     except ValueError:
         print("   - 警告: スコアのユニーク値が少なく、10分位に分割できませんでした。スキップします。")
@@ -892,11 +993,13 @@ def decile_analysis_v3(df, score_col, payout_col, split_name):
     plt.show()
 
 print("\n--- 全期間での最終デシル分析 ---")
+# 8️⃣ 既定は校正スコアを使う（無ければ生）
+_score_for_decile = 'pred_score_cal' if 'pred_score_cal' in test.columns else 'pred_score'
 decile_analysis_v3(
     df=test,
-    score_col='pred_score',
+    score_col=_score_for_decile,
     payout_col='place_payout',
-    split_name="Test (Full Period)"
+    split_name=f"Test (Full Period) [{_score_for_decile}]"
 )
 print("--- Cell-8: 完了 ---")
 
@@ -908,7 +1011,11 @@ print(f"\n--- Cell-9: 予測スコア閾値別の損益曲線分析を開始 ---
 
 def profit_curve_analysis(df, score_col, payout_col, split_name):
     print(f"\n[INFO] {split_name}データセットで損益曲線分析を実行します...")
-    df_analysis = df.copy().dropna(subset=[score_col, payout_col])
+    df_analysis = df.copy()
+
+    # スコア欠損だけを除外し、配当は NaN→0（不的中を残す）
+    df_analysis = df_analysis.dropna(subset=[score_col])
+    df_analysis[payout_col] = df_analysis[payout_col].fillna(0.0)
 
     min_score = df_analysis[score_col].min()
     max_score = df_analysis[score_col].quantile(0.99)
@@ -952,11 +1059,13 @@ def profit_curve_analysis(df, score_col, payout_col, split_name):
     plt.tight_layout()
     plt.show()
 
+# 8️⃣ 既定は校正スコア
+_score_for_curve = 'pred_score_cal' if 'pred_score_cal' in test.columns else 'pred_score'
 profit_curve_analysis(
     df=test,
-    score_col='pred_score',
+    score_col=_score_for_curve,
     payout_col='place_payout',
-    split_name="Test (Full Period)"
+    split_name=f"Test (Full Period) [{_score_for_curve}]"
 )
 print("--- Cell-9: 完了 ---")
 
@@ -967,11 +1076,16 @@ print("--- Cell-9: 完了 ---")
 print(f"\n--- Cell-10: 詳細な安定性検証を開始 ---")
 
 # ★★★【パッチ修正】KeyError回避のためhorse_numberを追加 ★★★
-minimal_test = test[[
+# 8️⃣ 校正スコアも持っていく（存在すれば）
+_base_cols = [
     "race_code", "pred_score", "place_payout", "win_payout",
     "track_surface_code", "race_condition_code", "num_horses",
     "date", "horse_number"
-]].copy()
+]
+if "pred_score_cal" in test.columns:
+    _base_cols.append("pred_score_cal")
+
+minimal_test = test[_base_cols].copy()
 
 # → season を付与
 def get_season(month):
@@ -992,8 +1106,10 @@ analysis_cols = {
     "トラック種別別": "track_surface_code",
 #    "競走条件別": "race_condition_code",
 #    "頭数別": "num_horses",
-
 }
+
+# 8️⃣ 既定は校正スコア
+score_key = "pred_score_cal" if "pred_score_cal" in minimal_test.columns else "pred_score"
 
 for analysis_name, col in analysis_cols.items():
     print(f"\n\n{'='*30} {analysis_name}での安定性検証 {'='*30}")
@@ -1011,28 +1127,146 @@ for analysis_name, col in analysis_cols.items():
         # copy() をせず、そのまま渡す  ← ★ RAM節約ポイント
         decile_analysis_v3(
             df=df_subset,
-            score_col='pred_score',
+            score_col=score_key,
             payout_col='place_payout',
-            split_name=split_name
+            split_name=split_name + f" [{score_key}]"
         )
 
 # ★★★【パッチ追加】予測の標準化エクスポート ★★★
 print(f"\n--- Cell-11: 予測の標準化エクスポートを開始 ---")
-def _pack(df, split):
-    # valid, test には pred_score が既にある前提
+
+def _require_cols(df: pd.DataFrame, name: str):
+    missing = [c for c in (MERGE_KEYS + ["pred_score"]) if c not in df.columns]
+    assert not missing, f"{name} に不足列があります: {missing}"
+
+def _pack(df: pd.DataFrame, split: str, cap: int) -> pd.DataFrame:
     out = df[MERGE_KEYS + ["pred_score"]].copy()
     out = out.rename(columns={"pred_score": "pred_ev_stage_b"})
+    out["pred_ev_stage_b"] = out["pred_ev_stage_b"].astype("float32").clip(lower=0, upper=cap)
+    if "pred_score_cal" in df.columns:
+        out["pred_ev_stage_b_cal"] = df["pred_score_cal"].astype("float32").clip(lower=0, upper=cap)
     out["split"] = split
     return out
 
 try:
-    df_export = pd.concat([_pack(valid, "valid"), _pack(minimal_test, "test")])
-    df_export.to_parquet(EXPORT_PATH_B, index=False, engine="pyarrow", compression="zstd")
-    print(f"✅ 予測エクスポート完了: {EXPORT_PATH_B}")
-except NameError:
-    print("[WARN] valid または minimal_test が存在しないため、エクスポートをスキップしました。")
-except Exception as e:
-    print(f"[ERROR] 予測エクスポート中にエラーが発生しました: {e}")
+    # minimal_test が無い環境でも動くようにフォールバック
+    target_test_df = None
+    if "minimal_test" in globals() and isinstance(minimal_test, pd.DataFrame):
+        target_test_df = minimal_test
+    elif "test" in globals() and isinstance(test, pd.DataFrame):
+        target_test_df = test
 
+    cap = int(stage_b_meta.get("payout_cap", locals().get("PAYOUT_CAP", 1000)))
+
+    export_parts = []
+
+    if "valid" in globals() and isinstance(valid, pd.DataFrame) and not valid.empty:
+        _require_cols(valid, "valid")
+        export_parts.append(_pack(valid, "valid", cap))
+
+    if target_test_df is not None and not target_test_df.empty:
+        _require_cols(target_test_df, "test/minimal_test")
+        export_parts.append(_pack(target_test_df, "test", cap))
+
+    if export_parts:
+        df_export = pd.concat(export_parts, ignore_index=True)
+
+        # 一意性チェック（将来のマージ時の事故防止）
+        dup_mask = df_export.duplicated(MERGE_KEYS + ["split"])
+        if dup_mask.any():
+            print("[WARN] MERGE_KEYS+split で重複が見つかりました。最後のものを優先して重複を除去します。")
+            df_export = df_export.drop_duplicates(MERGE_KEYS + ["split"], keep="last")
+
+        # NaN があればエラーに
+        assert df_export["pred_ev_stage_b"].notna().all(), "pred_ev_stage_b に NaN が含まれています。"
+
+        df_export.to_parquet(EXPORT_PATH_B, index=False, engine="pyarrow", compression="zstd")
+        print(f"✅ 予測エクスポート完了: {EXPORT_PATH_B} rows={len(df_export):,}")
+    else:
+        print("[WARN] valid / test のいずれにも有効な予測が無かったため、エクスポートをスキップしました。")
+
+except AssertionError as e:
+    print(f"[ERROR] 予測エクスポートの前提不一致: {e}")
+except NameError as e:
+    print(f"[WARN] 依存変数の未定義によりエクスポートをスキップ: {e}")
+except Exception as e:
+    print(f"[ERROR] 予測エクスポート中に例外: {e}")
 
 print("\n✅ Stage-B 全工程が完了しました。")
+
+
+# --- Cell-12 : Stage-B OOF 予測作成（年別Hold-Out） ---
+print("\n--- Cell-12: OOF 予測作成を開始 ---")
+try:
+    assert "date" in df_all.columns, "df_all に 'date' がありません。"
+    assert set(feature_cols).issubset(df_all.columns), "df_all に feature_cols の一部が存在しません。"
+
+    dty = pd.to_datetime(df_all["date"])
+    years_present = sorted(dty.dt.year.unique().tolist())
+
+    base_years = list(range(2016, 2025))  # 2016〜2024
+    first_year = int(min(years_present))
+    YEARS = [y for y in base_years if (y in years_present) and (y >= first_year + 1)]
+    print(f"[OOF] YEARS = {YEARS} (first_year={first_year})")
+
+    oof_list = []
+    cap = int(stage_b_meta.get("payout_cap", locals().get("PAYOUT_CAP", 1000)))
+
+    for y in YEARS:
+        ts_y = pd.Timestamp(f"{y}-01-01")
+        te_y = pd.Timestamp(f"{y}-12-31")
+
+        tr = df_all[dty < ts_y]
+        ho = df_all[(dty >= ts_y) & (dty <= te_y)]
+
+        if ho.empty:
+            print(f"[OOF] skip {y}: hold-out empty")
+            continue
+        if tr.empty or tr.shape[0] < 100:
+            print(f"[OOF] skip {y}: training history before {y} is empty or too small (rows={tr.shape[0]})")
+            continue
+
+        X_tr = tr[feature_cols]
+        y_tr = tr[TARGET_CAPPED].astype(float).values
+        w_tr = make_weights(tr)
+
+        if (X_tr.shape[0] == 0) or (X_tr.shape[1] == 0):
+            print(f"[OOF] skip {y}: X_tr invalid shape {X_tr.shape}")
+            continue
+
+        X_ho = ho[feature_cols]
+
+        dtr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr, categorical_feature=categorical_cols)
+        mdl = lgb.train(params, dtr, num_boost_round=int(best_iter))
+
+        ho_pred = mdl.predict(X_ho)
+        ho_pred = np.clip(ho_pred, 0, cap).astype("float32")
+
+        part = ho[MERGE_KEYS].copy()
+        part["pred_ev_stage_b_oof"] = ho_pred
+        part["oof_year"] = y
+
+        # 校正器があれば適用（任意）
+        try:
+            with open(iso_path, "rb") as f:
+                iso_oof = pkl.load(f)
+            part["pred_ev_stage_b_oof_cal"] = np.clip(iso_oof.predict(ho_pred), 0, cap).astype("float32")
+        except Exception:
+            pass
+
+        oof_list.append(part)
+        del dtr, mdl, X_tr, y_tr, w_tr, X_ho, ho_pred, part
+        gc.collect()
+
+    if oof_list:
+        df_oof = pd.concat(oof_list, ignore_index=True)
+        oof_path = os.path.join(ART_DIR_B, "JRA_stage_b_oof_predictions.parquet")
+        df_oof.to_parquet(oof_path, index=False, engine="pyarrow", compression="zstd")
+        print(f"[OOF] saved: {oof_path} rows={len(df_oof):,}")
+    else:
+        print("[OOF] 対象年が無かった／全てスキップされました。")
+
+except AssertionError as e:
+    print(f"[ERROR] OOF 前提不一致: {e}")
+except Exception as e:
+    print(f"[ERROR] OOF 予測作成中に例外: {e}")
