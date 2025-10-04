@@ -1,0 +1,1596 @@
+# =============================================================
+# Stage-C（JRA06専用）単勝的中率モデル｜フルコード v2（最小修正版）
+#  - 修正点:
+#     1) scale_pos_weight 影響コードを完全削除
+#     2) implied_win_odds / implied_place_odds / zone をdrop（FEATURESにも入らない）
+#     3) 予測は raw ロジットをレース内 softmax で正規化（Train/Valid/Test 全て）
+# =============================================================
+
+print("--- Stage-C: 単勝的中率モデル パイプライン（JRA06専用）開始 ---")
+
+# ------------------------
+# Cell-0: Imports & Config
+# ------------------------
+import os, gc, json, re, pathlib, warnings
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from datetime import datetime
+warnings.filterwarnings("ignore")
+
+SEED = 42
+np.random.seed(SEED)
+BET_UNIT = 100
+
+# マージキー（FULLキー）
+MERGE_KEYS = ["date", "race_code", "horse_number"]
+
+# JRA06 パス定義（JRA05 禁止）
+BASE_PARQUET = "/content/drive/My Drive/Colab/gpt/JRA06/JRA_base_data_2016.parquet"
+SP_DERIVED   = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_time_index_S/JRA_derived_features_from_sp_model.parquet"
+A_DERIVED    = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_a/JRA_derived_features_from_stage_a.parquet"
+B_OOF        = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_b/JRA_stage_b_oof_predictions.parquet"
+B_PRED       = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_b/JRA_stage_b_predictions.parquet"
+ART_DIR_C    = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c"
+CAND_DERIVED = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_cand/JRA_derived_features_from_stage_cand.parquet"
+
+pathlib.Path(ART_DIR_C).mkdir(parents=True, exist_ok=True)
+
+# カバレッジしきい値（未満なら停止）
+COV_MIN_SP = 0.95
+COV_MIN_A  = 0.95
+# B は学習期間で OOF が欠損し得るので “any(OOF or pred)” で 0.80 以上を推奨
+COV_MIN_B_ANY = 0.80
+
+# 厳格リークガード（疑義が強い場合は停止）。無効化は環境変数で
+STRICT_LEAK_GUARD = os.environ.get("STAGEC_STRICT_GUARD", "1") == "1"
+
+# 使用する BASE 列（ユーザー指定）
+BASE_COLS = [
+    # --- レース基本情報 ---
+    "race_code","date","month","race_number","venue_code","track_surface_code","track_code",
+    "distance","meeting_order","day_order","race_type_code","race_condition_code","num_horses",
+    "num_first_runners","num_front_runners","weight_type_code",
+    # --- 馬の基本情報 ---
+    "horse_number","sex_code","horse_age","horse_age_dec","career","weight_carried",
+    "distance_change","rest_weeks","runs_since_layoff","stable_transfer_flag","place_rate",
+    # --- オッズ・配当情報 ---
+    "win_payout","trifecta_support_rate","pred_odds","pred_popularity","implied_win_odds",
+    # --- 着順情報 ---
+    "finishing_position","last_finish",
+    # --- 予想/評価/指数 ---
+    "pred_time_index","pred_dash_index","score","score_w","score_ver3","default_score",
+    "pred_race_shape","fav_confidence",
+    # --- 過去走情報 ---
+    "last_field_size","last_venue_code","last_race_shape","last_final_3f_rank","last_jockey_rating",
+    "last_popularity","last_pop_finish_diff","last_margin",
+    # --- 関係者情報 ---
+    "jockey_age","trainer_age","jockey_rank","trainer_rank",
+    # --- 血統情報 ---
+    "bloodline_score",
+    # --- 差分/比率/統計 ---
+    "pred_win_idx_diff","upset_index","upset_index2","career_gap","weight_ratio","last_field_size_diff",
+    "fav_horse_rank_gap","stall_entry_order","pop_horse_score1","fav_horse_number_diff",
+    "body_weight_category"  # ← zone は読み込まない
+]
+
+# ------------------------
+# Cell-1: BASE 読込 & 型統一
+# ------------------------
+print("\n--- Cell-1: BASEデータ読込 & 列抽出 ---")
+print(f"   - {BASE_PARQUET} を読み込みます…")
+base = pd.read_parquet(BASE_PARQUET, engine="pyarrow")
+exist = [c for c in BASE_COLS if c in base.columns]
+miss  = [c for c in BASE_COLS if c not in base.columns]
+base = base[exist].copy()
+print(f"   - 指定列のうち存在: {len(exist)} / {len(BASE_COLS)}")
+if miss:
+    print(f"   - [WARN] 欠落列: {miss}")
+
+# キー型統一（date: datetime, race_code/horse_number: Int64）
+base["date"] = pd.to_datetime(base["date"])  # NaT 許容
+for k in ["race_code","horse_number"]:
+    if k in base.columns:
+        base[k] = pd.to_numeric(base[k], errors="coerce").astype("Int64")
+print("   - キー型統一: date=datetime64, race_code=Int64, horse_number=Int64")
+
+# 事前に MAIN の列集合を保持（後段ガード用）
+ALL_BASE_COLS = set(base.columns)
+
+# ------------------------
+# Cell-2: Stage-SP/A/B OOF & PRED を厳格マージ
+# ------------------------
+print("\n--- Cell-2: Stage-SP/A/B2/B の成果物を読み込みます ---")
+
+# 型統一のユーティリティ
+def _unify_keys(df: pd.DataFrame) -> pd.DataFrame:
+    for k in MERGE_KEYS:
+        assert k in df.columns, f"マージキー '{k}' がDataFrameに存在しません。"
+    df["date"] = pd.to_datetime(df["date"])  # NaT 許容
+    for k in ["race_code","horse_number"]:
+        df[k] = pd.to_numeric(df[k], errors="coerce").astype("Int64")
+    return df
+
+# --- Stage-SP ---
+sp_cols_allow = [
+    # race内派生セット（リーク性なし）
+    "pred_time_index_sp"
+    #,"rank_pred_time_index_sp","mean_pred_time_index_sp_race",
+    #"std_pred_time_index_sp_race","dev_pred_time_index_sp_race","top_pred_time_index_sp_race",
+    #"diff_to_top_pred_time_index_sp",
+]
+try:
+    sp = pd.read_parquet(SP_DERIVED, engine="pyarrow")
+    sp = sp[[c for c in MERGE_KEYS + sp_cols_allow if c in sp.columns]].copy()
+    sp = _unify_keys(sp)
+    # キー重複は即停止
+    if sp.duplicated(MERGE_KEYS).any():
+        dup = int(sp.duplicated(MERGE_KEYS).sum())
+        raise RuntimeError(f"Stage-SPのマージキーに重複があります（{dup}件）。上流を修正してください。")
+    before = len(base)
+    base = base.merge(sp, on=MERGE_KEYS, how="left")
+    print(f"[MERGE] Stage-SP を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
+except FileNotFoundError:
+    raise RuntimeError(f"Stage-SP ファイルが見つかりません: {SP_DERIVED}")
+
+# --- Stage-A ---
+try:
+    a = pd.read_parquet(A_DERIVED, engine="pyarrow")
+    a_keep = [c for c in [*MERGE_KEYS, "pred_prob_stage_a"] if c in a.columns] #, "sp_gap","sp_percentile","sp_rank_in_race","prob_gap_vs_win"
+    a = a[a_keep].copy()
+    a = _unify_keys(a)
+    if a.duplicated(MERGE_KEYS).any():
+        dup = int(a.duplicated(MERGE_KEYS).sum())
+        raise RuntimeError(f"Stage-Aのマージキーに重複があります（{dup}件）。上流を修正してください。")
+    base = base.merge(a, on=MERGE_KEYS, how="left")
+    print(f"[MERGE] Stage-A を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
+except FileNotFoundError:
+    raise RuntimeError(f"Stage-A ファイルが見つかりません: {A_DERIVED}")
+
+
+# --- Stage-CAND（候補特徴群）---
+cov_cand_any = 0.0
+CAND_COLS_MERGED = []
+try:
+    cand = pd.read_parquet(CAND_DERIVED, engine="pyarrow")
+    cand = _unify_keys(cand)
+
+    # 1) 明確なリーク/不整合列を物理除外（存在しても学習に渡さない）
+    #   - payout/finish/target系、学習時に不要な重み/フラグなどは落とす
+    drop_exact = {
+        "win_payout","place_payout","finishing_position",
+        "target","target_raw","target_capped",
+        "sample_weight_cand","exclude_flag_095","bottom3_by_cand",
+        "time_index"  # 本パイプラインでは未使用
+    }
+    drop_regex = (r"^target_.*", r".*_payout$", r"^y_.*", r".*_label$")
+
+    to_drop = set()
+    for c in cand.columns:
+        if c in MERGE_KEYS:
+            continue
+        if c in drop_exact:
+            to_drop.add(c); continue
+        if any(re.match(patt, c) for patt in drop_regex):
+            to_drop.add(c)
+    if to_drop:
+        cand.drop(columns=list(to_drop), inplace=True, errors="ignore")
+
+    # 2) 既に base にある列名との衝突は除外（キー以外は上書きしない方針）
+    dup_cols = [c for c in cand.columns if (c in base.columns and c not in MERGE_KEYS)]
+    if dup_cols:
+        print(f"   - [INFO] Stage-CAND 既存列と重複のため除外: {dup_cols[:8]}{' ...' if len(dup_cols)>8 else ''}")
+        cand.drop(columns=dup_cols, inplace=True, errors="ignore")
+
+    # 3) マージキー重複チェック
+    if cand.duplicated(MERGE_KEYS).any():
+        dup = int(cand.duplicated(MERGE_KEYS).sum())
+        raise RuntimeError(f"Stage-CANDのマージキーに重複があります（{dup}件）。上流を修正してください。")
+
+    # 4) LEFT JOIN
+    before = len(base)
+    base = base.merge(cand, on=MERGE_KEYS, how="left")
+    CAND_COLS_MERGED = [c for c in cand.columns if c not in MERGE_KEYS]
+    print(f"[MERGE] Stage-CAND を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
+
+    # 5) カバレッジ（any非欠損）を参考表示
+    if CAND_COLS_MERGED:
+        _nn = base[CAND_COLS_MERGED].notna().any(axis=1)
+        cov_cand_any = float(_nn.mean())
+        print(f"   - Stage-CAND 非欠損率(any): {cov_cand_any*100:.1f}%")
+
+except FileNotFoundError:
+    print(f"   - [WARN] Stage-CAND ファイルが見つかりません: {CAND_DERIVED}")
+
+
+
+# --- Stage-B OOF（stage-b2 相当）---
+try:
+    b_oof = pd.read_parquet(B_OOF, engine="pyarrow")
+    # 列正規化
+    rename_map = {}
+    if "pred_ev_stage_b" in b_oof.columns:
+        rename_map["pred_ev_stage_b"] = "pred_ev_stage_b_oof"
+    b_oof = b_oof.rename(columns=rename_map)
+    b_oof = b_oof[[c for c in [*MERGE_KEYS, "pred_ev_stage_b_oof"] if c in b_oof.columns]].copy()
+    b_oof = _unify_keys(b_oof)
+    if b_oof.duplicated(MERGE_KEYS).any():
+        dup = int(b_oof.duplicated(MERGE_KEYS).sum())
+        raise RuntimeError(f"Stage-B OOF のマージキーに重複があります（{dup}件）。上流を修正してください。")
+    base = base.merge(b_oof, on=MERGE_KEYS, how="left")
+    print(f"[MERGE] Stage-B2(OOF) を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
+except FileNotFoundError:
+    print("   - [WARN] Stage-B2(OOF) が見つかりません。OOFは無しで進行します。")
+
+# --- Stage-B pred（valid/test 用）---
+try:
+    b_pred = pd.read_parquet(B_PRED, engine="pyarrow")
+    rename_map = {}
+    if "pred_ev_stage_b" in b_pred.columns:
+        rename_map["pred_ev_stage_b"] = "pred_ev_stage_b_pred"
+    b_pred = b_pred.rename(columns=rename_map)
+    keep = [c for c in [*MERGE_KEYS, "pred_ev_stage_b_pred", "split"] if c in b_pred.columns]
+    b_pred = b_pred[keep].copy()
+    b_pred = _unify_keys(b_pred)
+    if b_pred.duplicated(MERGE_KEYS).any():
+        dup = int(b_pred.duplicated(MERGE_KEYS).sum())
+        raise RuntimeError(f"Stage-B(pred) のマージキーに重複があります（{dup}件）。上流を修正してください。")
+    base = base.merge(b_pred, on=MERGE_KEYS, how="left")
+    print(f"[MERGE] Stage-B(pred) を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
+except FileNotFoundError:
+    print("   - [WARN] Stage-B(pred) が見つかりません。predは無しで進行します。")
+
+# any 列作成（OOF優先）
+if "pred_ev_stage_b_oof" in base.columns or "pred_ev_stage_b_pred" in base.columns:
+    base["pred_ev_stage_b_any"] = base["pred_ev_stage_b_oof"].fillna(base.get("pred_ev_stage_b_pred"))
+else:
+    base["pred_ev_stage_b_any"] = np.nan
+
+# カバレッジ確認
+probe = {
+    "SP:pred_time_index_sp": base["pred_time_index_sp"].notna().mean() if "pred_time_index_sp" in base.columns else 0.0,
+    "A:pred_prob_stage_a":    base["pred_prob_stage_a"].notna().mean() if "pred_prob_stage_a" in base.columns else 0.0,
+    "B:any":                   base["pred_ev_stage_b_any"].notna().mean() if "pred_ev_stage_b_any" in base.columns else 0.0,
+    "CAND:any":                cov_cand_any  # ← これを追加
+}
+print("\n[INFO] 'pred_ev_stage_b_any' を作成（OOF優先→pred）")
+for k,v in probe.items():
+    print(f"   - {k} 非欠損率: {v*100:.1f}%")
+
+# 厳格停止条件
+if probe.get("SP:pred_time_index_sp",0) < COV_MIN_SP:
+    raise RuntimeError(f"Stage-SP カバー率不足: {probe['SP:pred_time_index_sp']*100:.1f}% < {COV_MIN_SP*100:.0f}%")
+if probe.get("A:pred_prob_stage_a",0) < COV_MIN_A:
+    raise RuntimeError(f"Stage-A カバー率不足: {probe['A:pred_prob_stage_a']*100:.1f}% < {COV_MIN_A*100:.0f}%")
+# B は any ベースで緩め（足切りは警告のみ）
+if probe.get("B:any",0) < COV_MIN_B_ANY:
+    print(f"   - [WARN] Stage-B(any) カバー率が低いです: {probe['B:any']*100:.1f}% < {COV_MIN_B_ANY*100:.0f}%")
+
+
+
+print("--- Cell-2: マージ完了 ---")
+
+# --------------------------------------------------
+# Cell-3: 時系列分割（開始・終了を明示）
+# --------------------------------------------------
+print("\n[INFO] 時系列に基づきデータを3つに分割します…")
+base_sorted = base.sort_values("date").reset_index(drop=True)
+# 後段のチェックで参照するために保持
+df_all_for_guard = base_sorted.copy()
+
+# 学習・評価期間（JRA用）
+#TRAIN_START_DATE = pd.to_datetime("2016-01-01")
+TRAIN_START_DATE = pd.to_datetime("2022-01-01") #短縮版！！！！！！！！！！！！！！！！
+VALID_START_DATE = pd.to_datetime("2023-04-01")
+VALID_END_DATE   = pd.to_datetime("2024-03-31")
+TEST_START_DATE  = pd.to_datetime("2024-04-01")
+TEST_END_DATE    = pd.to_datetime("2025-08-31")
+TRAIN_END_DATE   = VALID_START_DATE - pd.Timedelta(days=1)
+
+train = base_sorted[(base_sorted["date"] >= TRAIN_START_DATE) & (base_sorted["date"] <= TRAIN_END_DATE)].copy()
+valid = base_sorted[(base_sorted["date"] >= VALID_START_DATE) & (base_sorted["date"] <= VALID_END_DATE)].copy()
+test  = base_sorted[(base_sorted["date"] >= TEST_START_DATE)  & (base_sorted["date"] <= TEST_END_DATE)].copy()
+
+# メモリ解放
+del base, base_sorted; gc.collect()
+
+if train.empty or valid.empty or test.empty:
+    raise RuntimeError("データ分割後、いずれかのセットが空になりました。日付範囲を確認してください。")
+
+print(f"   - 学習期間:   {TRAIN_START_DATE.date()} 〜 {TRAIN_END_DATE.date()}")
+print(f"   - 検証期間:   {VALID_START_DATE.date()} 〜 {VALID_END_DATE.date()}")
+print(f"   - テスト期間: {TEST_START_DATE.date()} 〜 {TEST_END_DATE.date()}")
+print(f"   - Train={len(train):,}  Valid={len(valid):,}  Test={len(test):,}")
+
+# セット別 B(any) カバー率
+for name, df_ in (("Train", train), ("Valid", valid), ("Test", test)):
+    cov = df_["pred_ev_stage_b_any"].notna().mean() if "pred_ev_stage_b_any" in df_.columns else 0.0
+    print(f"   - [{name}] Stage-B(any) 非欠損率: {cov*100:.1f}%")
+
+# --------------------------------------------------
+# Cell-4: 目的変数（単勝） & 前処理
+# --------------------------------------------------
+print("\n--- Cell-4: 目的変数 & 前処理 ---")
+
+# 目的変数（単勝的中=1）
+for _df in (train, valid, test):
+    _df["y_win"] = (_df["finishing_position"] == 1).astype("int8")
+
+# 単純なカテゴリ整形（zone は除外済のため残っていればカテゴリ化しない）
+cat_cols = [
+    c for c in [
+        "venue_code","track_surface_code","track_code","race_type_code","race_condition_code",
+        "sex_code","weight_type_code","body_weight_category",
+        "grade_code","last_venue_code","weekday_code","po_horse_flag","anagusa_flag","blinker_change_flag",
+          # ← zone は含めない
+    ] if c in df_all_for_guard.columns
+]
+for c in cat_cols:
+    for _df in (train, valid, test):
+        if _df[c].dtype.name == "category":
+            continue
+        _df[c] = _df[c].astype("string").fillna("__NA__").astype("category")
+
+# 0/1 フラグ整形（object→0/1）
+flag_cols = [c for c in ["stable_transfer_flag"] if c in df_all_for_guard.columns]
+for c in flag_cols:
+    for _df in (train, valid, test):
+        s = _df[c]
+        if s.dtype == "bool":
+            _df[c] = s.astype("int8")
+        else:
+            _df[c] = s.astype("string").str.lower().map({"1":1,"true":1,"t":1,"y":1,"yes":1,"on":1,
+                                                           "0":0,"false":0,"f":0,"n":0,"no":0,"off":0}).fillna(0).astype("int8")
+
+# レース内派生特徴量（rank / z-score / top-gap）
+RACE_GROUP = ["date","race_code"]
+
+# === New: 季節・距離の簡易特徴 ===
+def _season(m):
+    if m in (3,4,5):   return "Spring"
+    if m in (6,7,8):   return "Summer"
+    if m in (9,10,11): return "Autumn"
+    return "Winter"
+
+for _df in (train, valid, test):
+    # season（month→カテゴリ）
+    _df["season"] = _df["month"].map(_season).astype("string").fillna("__NA__").astype("category")
+    # 400mビン（例: 1200, 1400, 1600 ...）→ 文字カテゴリ化して一致性を担保
+    _df["distance_bin_400"] = ((_df["distance"] // 400) * 400).astype("Int64").astype("string").fillna("__NA__").astype("category")
+    # 距離クラス（ざっくり3分割）
+    _df["distance_class3"] = pd.cut(
+        _df["distance"].astype(float),
+        bins=[0, 1400, 2000, 10000],
+        labels=["Short","Middle","Long"],
+        include_lowest=True
+    ).astype("category")
+
+
+# ★ Stage-C: 頭数binの付与（split後すぐ or feature確定直前）
+def add_field_size_bin4(df, src_col="num_horses", new_col="num_horses_bin4"):
+    bins   = [0, 8, 12, 16, 99]                 # 右閉
+    labels = ["<=8", "9-12", "13-16", "17+"]
+    df[new_col] = pd.cut(pd.to_numeric(df[src_col], errors="coerce"),
+                         bins=bins, labels=labels, right=True, include_lowest=True).astype("category")
+
+for _df in (train, valid, test):
+    add_field_size_bin4(_df)
+
+# 特徴量リストへ追加（名前差吸収）
+cat_name = "num_horses_bin4"
+if "feature_cols" in globals():
+    feature_cols = list(dict.fromkeys(feature_cols + [cat_name]))
+if "FEATURES" in globals():
+    FEATURES = list(dict.fromkeys(FEATURES + [cat_name]))
+
+# カテゴリ列へ追加（存在する変数名に揃える）
+if "cat_cols_final" in globals():
+    cat_cols_final = sorted(list(set(list(cat_cols_final) + [cat_name])))
+elif "cat_cols" in globals():
+    cat_cols = sorted(list(set(list(cat_cols) + [cat_name])))
+elif "categorical_cols" in globals():
+    categorical_cols = sorted(list(set(list(categorical_cols) + [cat_name])))
+
+
+# LGBMに渡す追加カテゴリ列（後で cat_cols_final に結合）
+extra_cat_cols = ["season","distance_bin_400","distance_class3"]
+
+
+race_feats_src = [
+    # 予想/指数系（存在すれば）
+    "pred_time_index","pred_dash_index","score","score_w","score_ver3","default_score",
+    # Stage-SP
+    "pred_time_index_sp",
+    #"rank_pred_time_index_sp","mean_pred_time_index_sp_race",
+    #"std_pred_time_index_sp_race","dev_pred_time_index_sp_race","top_pred_time_index_sp_race",
+    #"diff_to_top_pred_time_index_sp",
+    # Stage-A / B
+    "pred_prob_stage_a",
+    #"sp_gap","sp_percentile","sp_rank_in_race",
+    "pred_ev_stage_b_any"  # ← ここに追加
+]
+
+
+for col in race_feats_src:
+    for _df in (train, valid, test):
+        if col not in _df.columns:
+            continue
+        s = _df[col].astype(float)
+        # rank（大きいほど良い前提）
+        _df[f"r_{col}"] = s.groupby(_df[RACE_GROUP].apply(tuple, axis=1)) \
+                           .rank(ascending=False, method="first").astype("float32")
+        # z-score（レース内）
+        g = _df.groupby(RACE_GROUP)[col]
+        mu = g.transform("mean").astype("float32")
+        sd = g.transform("std").astype("float32").replace(0, np.nan)
+        _df[f"z_{col}"] = ((s - mu) / sd).astype("float32").fillna(0.0)
+        # top-gap（上位との差）
+        top = g.transform("max").astype("float32")
+        _df[f"gap_{col}"] = (top - s).astype("float32")
+
+
+# === New: r_*（レース内順位）群からの総合順位平均 & 偏差値 ===
+def _keep_r_col(c: str) -> bool:
+    """r_* のうち ‘二重順位/派生順位’ を除外して集計対象だけを残す"""
+    if not c.startswith("r_"):
+        return False
+    # rank/mean/std/dev/top/diff/gap からの再ランキングは除外
+    bad_prefixes = (
+        "r_rank_", "r_mean_", "r_std_", "r_dev_", "r_top_", "r_diff_", "r_gap_",
+        "r_sp_rank_in_race"  # 念のため
+    )
+    return not any(c.startswith(b) for b in bad_prefixes)
+
+r_cols_all = [c for c in train.columns if _keep_r_col(c)]
+if r_cols_all:
+    for _df in (train, valid, test):
+        n_in_race = _df.groupby(["date","race_code"])["horse_number"] \
+                       .transform("count").astype("float32")
+        R = _df[r_cols_all].astype("float32")
+        R_rev = (n_in_race.values.reshape(-1,1) + 1.0) - R.values  # 1位→n に反転
+        r_mean_all = np.nanmean(R_rev, axis=1).astype("float32")
+        _df["r_mean_all"] = r_mean_all
+
+        g = _df.groupby(["date","race_code"])["r_mean_all"]
+        mu = g.transform("mean").astype("float32")
+        sd = g.transform("std").astype("float32").replace(0, np.nan)
+        _df["dev_r_mean_all"] = (50.0 + 10.0 * (_df["r_mean_all"] - mu) / sd) \
+                                  .astype("float32").fillna(50.0)
+else:
+    print("   - [NOTE] r_* が見つからなかったため、総合順位特徴はスキップしました。")
+
+
+# 置き換え：FEATURES を「分割後・派生作成後」の列から作る
+ALL_COLS_UNION = sorted(set(train.columns) | set(valid.columns) | set(test.columns))
+
+# 使わない/リーク列
+LEAK_DROP = [
+    "win_payout","finishing_position",
+#    "trifecta_support_rate",
+    "implied_place_odds","implied_win_odds","zone",
+    "y_win","split"  # 目的変数
+]
+
+FEATURES = [c for c in ALL_COLS_UNION if c not in set(LEAK_DROP + MERGE_KEYS + ["race_number","date"])]
+
+# LightGBM に渡すカテゴリ列は FEATURES との共通部分に限定
+cat_cols_final = [c for c in (cat_cols + extra_cat_cols) if c in FEATURES]
+
+# object型でカテゴリ指定されていないものは念のため除外
+obj_bad = [c for c in FEATURES
+           if (str(train[c].dtype) == "object") and (c not in cat_cols_final)]
+if obj_bad:
+    FEATURES = [c for c in FEATURES if c not in obj_bad]
+    print(f"   - [NOTE] object型かつ未カテゴリの列を除外: {obj_bad[:6]}{' ...' if len(obj_bad)>6 else ''}")
+
+print(f"   - v2 特徴量 数: {len(FEATURES)}  （カテゴリ列: {len(cat_cols_final)}）")
+
+
+# ------------------------
+# Cell-4.5: 健全性ガード（エラー停止）
+# ------------------------
+print("\n[GUARD] 単勝評価の健全性チェックを開始します…")
+EVAL_PAYOUT_COL = "win_payout"  # 評価は単勝のみ
+if EVAL_PAYOUT_COL not in ALL_BASE_COLS:
+    raise RuntimeError(f"[FATAL] 評価列 '{EVAL_PAYOUT_COL}' が見つかりません。BASE_PARQUET を確認してください。")
+
+# 直近のリーク一次検査：FEATURES にリーク候補が混入していないか
+suspicious = [c for c in ["win_payout","finishing_position"] if c in FEATURES] #,"trifecta_support_rate"
+if suspicious:
+    raise RuntimeError(f"[FATAL] リーク候補列が学習特徴量に含まれています: {suspicious}")
+
+
+# ────────────────────────────────────────────────
+# Cell-4.5 : Soft-Finish OOF特徴の作成（Stage-C 用）
+#   s = 1, 0.25, 0.15, 0.05(4-5着), 0 を TimeSeriesSplit で回帰学習（時系列リーク対策）
+#   string dtypes を category に統一して LightGBM に渡す（型不一致対策）
+#   出力: train/valid/test すべてに 'feat_soft_finish' を付与し、feature_cols に追加
+# ────────────────────────────────────────────────
+print("\n" + "="*50)
+print("◎ Soft-Finish OOF特徴の作成（Stage-C）")
+print("="*50)
+
+import os, json, gc
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import TimeSeriesSplit
+
+# === Winsorize 設定（Train OOF の分布で閾値を決定） =====================
+WINSOR_Q_LOW  = float(os.environ.get("SF_WINSOR_Q_LOW",  0.005))  # 下位0.5%
+WINSOR_Q_HIGH = float(os.environ.get("SF_WINSOR_Q_HIGH", 0.995))  # 上位99.5%
+assert 0.0 <= WINSOR_Q_LOW < WINSOR_Q_HIGH <= 1.0
+
+# === 既存メタを拾う（環境差吸収） ==================================
+def _pick_feature_cols():
+    for k in ('feature_cols', 'FEATURE_COLS', 'FEATURES'):
+        if k in globals(): return list(globals()[k])
+    raise RuntimeError("[FATAL] feature_cols/FEATURE_COLS/FEATURES が見つかりません。")
+
+def _pick_cat_cols():
+    for k in ('categorical_cols', 'cat_cols', 'CAT_COLS', 'cat_cols_final'):
+        if k in globals(): return list(globals()[k])
+    # フォールバック：型から推定
+    cols = _pick_feature_cols()
+    return [c for c in cols if str(train[c].dtype) in ("category","object","string")]
+
+SEED = globals().get('SEED', 42)
+FEAT_COLS_ALL = _pick_feature_cols()
+CAT_COLS_RAW  = _pick_cat_cols()
+
+# 明示的に除外（アウトカムや配当などのリーク源が紛れた場合の安全弁）
+LEAK_LIKE = {'finishing_position','finish_position','win_payout','place_payout','y_win','y_place','result_time'}
+FEAT_COLS_SF = [c for c in FEAT_COLS_ALL if c not in LEAK_LIKE]
+
+# === string/object を train 由来カテゴリで “category” に統一 =========
+def _coerce_to_train_categories(train_df, apply_dfs, cat_candidates):
+    cat_used = []
+    cats_dict = {}
+    for c in cat_candidates:
+        if c not in train_df.columns:
+            continue
+        dt = str(train_df[c].dtype)
+        if dt in ("category","object","string"):
+            s_tr = train_df[c].astype("string").fillna("__NA__")
+            cats = sorted(s_tr.unique().tolist())
+            cats_dict[c] = cats
+            cat_used.append(c)
+    # apply
+    for df_ in apply_dfs:
+        for c, cats in cats_dict.items():
+            if c in df_.columns:
+                s = df_[c].astype("string").fillna("__NA__")
+                df_[c] = pd.Categorical(s, categories=cats)
+    return cat_used, cats_dict
+
+cat_used_sf, cat_categories_sf = _coerce_to_train_categories(train, [train, valid, test], CAT_COLS_RAW)
+
+# === Soft-Finish のターゲット s を作成 =================================
+def _soft_finish_target(df):
+    pos = pd.to_numeric(df.get('finishing_position'), errors='coerce').fillna(0).astype(int)
+    s = np.zeros(len(df), dtype='float32')
+    s[pos == 1] = 1.00
+    s[pos == 2] = 0.25
+    s[pos == 3] = 0.15
+    s[(pos == 4) | (pos == 5)] = 0.05
+    return s
+
+y_sf = _soft_finish_target(train)
+
+# --- ここから追加（自己参照/存在チェックガード）-------------------------
+# feat_soft_finish（これから作る特徴）は学習入力から必ず除外
+EXCLUDE_SF_COLS = {'feat_soft_finish'}
+# ついでに、train に存在しない列も落として KeyError を根絶
+FEAT_COLS_SF = [c for c in FEAT_COLS_SF if c not in EXCLUDE_SF_COLS and c in train.columns]
+# valid/test にも存在しない列があれば落とす（予測時の KeyError 防止）
+_common = [c for c in FEAT_COLS_SF if (c in valid.columns and c in test.columns)]
+if len(_common) < len(FEAT_COLS_SF):
+    drop_n = len(FEAT_COLS_SF) - len(_common)
+    print(f"[WARN] Soft-Finish: valid/test に無い列を {drop_n} 個削除しました。")
+    FEAT_COLS_SF = _common
+# categorical_feature にも同じ整合性を取る（LGBMに存在しないcat名を渡さない）
+cat_used_sf = [c for c in cat_used_sf if c in FEAT_COLS_SF]
+# ----------------------------------------------------------------------
+
+# === OOF 学習（TimeSeriesSplit で時系列リーク防止） ====================
+sf_n_splits = int(os.environ.get("SF_OOF_K", 3))
+print(f"[INFO] Soft-Finish OOF を作成します: n_splits={sf_n_splits} / splitter=TimeSeriesSplit（将来データ未混入）")
+sf_splitter = TimeSeriesSplit(n_splits=sf_n_splits)
+
+oof_sf = np.zeros(len(train), dtype="float32")
+best_iters = []
+
+params_sf = {
+    "objective": "regression_l2",
+    "metric": "rmse",
+    "first_metric_only": True,
+    "boosting_type": "gbdt",
+    "learning_rate": 0.05,
+    "num_leaves": 127,
+    "min_data_in_leaf": 80,
+    "feature_fraction": 0.85,
+    "bagging_fraction": 0.8,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "max_bin": 127,
+    "force_col_wise": True,
+    "two_round": True,
+    "seed": SEED,
+    "feature_fraction_seed": SEED,
+    "bagging_seed": SEED,
+    "data_random_seed": SEED,
+    "verbosity": -1,
+    "num_threads": -1,
+}
+
+# === Soft-Finish: Optuna best params で上書き（最小差分）================
+SF_OPTUNA_BEST_PARAMS = {
+    "learning_rate": 0.022337835932350347,
+    "num_leaves": 36,
+    "min_data_in_leaf": 150,
+    "feature_fraction": 0.726764747776563,
+    "bagging_fraction": 0.9011487502306803,
+    "bagging_freq": 6,
+    "lambda_l1": 5.572042886691552,
+    "lambda_l2": 3.741982796639425,
+    "min_gain_to_split": 0.006857114218896185,
+    "feature_fraction_bynode": 0.7486419238599451  # v3+ で有効
+}
+_before = {k: params_sf.get(k) for k in SF_OPTUNA_BEST_PARAMS.keys()}
+params_sf.update(SF_OPTUNA_BEST_PARAMS)
+_after  = {k: params_sf.get(k) for k in SF_OPTUNA_BEST_PARAMS.keys()}
+print("[SF-OPTUNA] Soft-Finish params overridden (before -> after):")
+for k in SF_OPTUNA_BEST_PARAMS.keys():
+    print(f"   - {k}: {_before[k]} -> {_after[k]}")
+
+for fold, (tr_idx, va_idx) in enumerate(sf_splitter.split(train), 1):
+    # ログ（学習の最大日付 < 検証の最小日付 を目視確認できるように）
+    try:
+        d_tr_max = pd.to_datetime(train.iloc[tr_idx]['date']).max()
+        d_va_min = pd.to_datetime(train.iloc[va_idx]['date']).min()
+        d_va_max = pd.to_datetime(train.iloc[va_idx]['date']).max()
+        print(f"  - Fold {fold}/{sf_n_splits} | train<=[{d_tr_max.date()}] -> valid[{d_va_min.date()}~{d_va_max.date()}]")
+    except Exception:
+        print(f"  - Fold {fold}/{sf_n_splits}")
+
+    X_tr = train.iloc[tr_idx][FEAT_COLS_SF]
+    X_va = train.iloc[va_idx][FEAT_COLS_SF]
+    y_tr = y_sf[tr_idx]
+    y_va = y_sf[va_idx]
+
+    d_tr = lgb.Dataset(
+        X_tr, label=y_tr, categorical_feature=cat_used_sf,
+        params={"max_bin": params_sf["max_bin"], "two_round": params_sf["two_round"], "data_random_seed": params_sf["data_random_seed"]},
+        free_raw_data=False
+    )
+    d_va = lgb.Dataset(
+        X_va, label=y_va, categorical_feature=cat_used_sf,
+        reference=d_tr,
+        params={"max_bin": params_sf["max_bin"], "two_round": params_sf["two_round"], "data_random_seed": params_sf["data_random_seed"]},
+        free_raw_data=False
+    )
+
+    model_sf = lgb.train(
+        params=params_sf,
+        train_set=d_tr,
+        valid_sets=[d_va],
+        valid_names=["valid"],
+        num_boost_round=3000,
+        callbacks=[lgb.early_stopping(stopping_rounds=100, verbose=False),
+                   lgb.log_evaluation(period=0)]
+    )
+
+    oof_sf[va_idx] = model_sf.predict(X_va, num_iteration=model_sf.best_iteration)
+    best_iters.append(int(model_sf.best_iteration or 100))
+
+    # 明示解放（RAM抑制）
+    del d_tr, d_va, X_tr, X_va, y_tr, y_va, model_sf
+    gc.collect()
+
+print(f"[INFO] OOF完成（soft-finish）: train.shape={oof_sf.shape}, valid/test は全学習モデルで推論します")
+print(f"      best_iter (median/mean) = {int(np.median(best_iters))} / {float(np.mean(best_iters)):.1f}")
+
+# === Train 全体で最終学習 → Valid/Test 推論 ============================
+num_boost_round_sf = int(np.median(best_iters))
+d_all = lgb.Dataset(
+    train[FEAT_COLS_SF], label=y_sf, categorical_feature=cat_used_sf,
+    params={"max_bin": params_sf["max_bin"], "two_round": params_sf["two_round"], "data_random_seed": params_sf["data_random_seed"]},
+    free_raw_data=False
+)
+final_sf = lgb.train(params=params_sf, train_set=d_all, num_boost_round=num_boost_round_sf)
+
+# 予測の付与（← の前に Winsorize を挟む）
+# --- Train OOF 分布で上下閾値を決定 ---
+lo, hi = np.quantile(oof_sf, [WINSOR_Q_LOW, WINSOR_Q_HIGH])
+if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+    # フォールバック：分布が極端な場合は、最小/最大の微小拡張に退避
+    lo = float(np.nanmin(oof_sf))
+    hi = float(np.nanmax(oof_sf))
+    eps = max(1e-6, 1e-3 * (hi - lo))
+    lo, hi = lo - eps, hi + eps
+print(f"[WINSOR] Soft-Finish caps from OOF: q{WINSOR_Q_LOW:.3f}={lo:.4f}, q{WINSOR_Q_HIGH:.3f}={hi:.4f}")
+
+# --- Valid/Test 用の生推論を先に作る ---
+_pred_va_sf = final_sf.predict(valid[FEAT_COLS_SF], num_iteration=num_boost_round_sf).astype("float32")
+_pred_te_sf = final_sf.predict(test[FEAT_COLS_SF],  num_iteration=num_boost_round_sf).astype("float32")
+
+# --- クリップ適用（外れ抑制）---
+oof_sf_w   = np.clip(oof_sf,    lo, hi).astype("float32")
+pred_va_sf = np.clip(_pred_va_sf, lo, hi).astype("float32")
+pred_te_sf = np.clip(_pred_te_sf, lo, hi).astype("float32")
+
+# 付与
+train['feat_soft_finish'] = oof_sf_w
+valid['feat_soft_finish'] = pred_va_sf
+test['feat_soft_finish']  = pred_te_sf
+
+# 参考統計（winsorize 後）
+def _q(a): return np.quantile(a, [0, .5, .9, .99, 1.0])
+qt_tr = _q(train['feat_soft_finish'].values)
+qt_va = _q(valid['feat_soft_finish'].values)
+qt_te = _q(test['feat_soft_finish'].values)
+print(f"[STAT] (winsor) feat_soft_finish Train  min/p50/p90/p99/max = {qt_tr[0]:.3f}/{qt_tr[1]:.3f}/{qt_tr[2]:.3f}/{qt_tr[3]:.3f}/{qt_tr[4]:.3f}")
+print(f"[STAT] (winsor) feat_soft_finish Valid  min/p50/p90/p99/max = {qt_va[0]:.3f}/{qt_va[1]:.3f}/{qt_va[2]:.3f}/{qt_va[3]:.3f}/{qt_va[4]:.3f}")
+print(f"[STAT] (winsor) feat_soft_finish Test   min/p50/p90/p99/max = {qt_te[0]:.3f}/{qt_te[1]:.3f}/{qt_te[2]:.3f}/{qt_te[3]:.3f}/{qt_te[4]:.3f}")
+
+if 'y_win' in train.columns:
+    corr = pd.Series(train['feat_soft_finish']).corr(pd.Series(train['y_win']).astype(float))
+    print(f"[STAT] Corr(feat_soft_finish, y_win) on Train = {corr:.4f}")
+
+# === 特徴量セットへ注入 =================================================
+if 'feature_cols' in globals():
+    if 'feat_soft_finish' not in feature_cols: feature_cols.append('feat_soft_finish')
+elif 'FEATURES' in globals():
+    if 'feat_soft_finish' not in FEATURES: FEATURES.append('feat_soft_finish')
+elif 'FEATURE_COLS' in globals():
+    if 'feat_soft_finish' not in FEATURE_COLS: FEATURE_COLS.append('feat_soft_finish')
+
+# === メタ保存（today 用） ==============================================
+try:
+    ART_DIR_C = globals().get('ART_DIR_C', "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c")
+    os.makedirs(ART_DIR_C, exist_ok=True)
+    SF_MODEL_PATH = os.path.join(ART_DIR_C, "JRA_stage_c_softfinish_model.txt")
+    final_sf.save_model(SF_MODEL_PATH)
+
+    meta_path = globals().get('STAGE_C_META_PATH', os.path.join(ART_DIR_C, "JRA_stage_c_meta.json"))
+    meta = {}
+    if os.path.exists(meta_path):
+        with open(meta_path, "r", encoding="utf-8") as f: meta = json.load(f)
+    meta.setdefault("soft_finish", {})
+    meta["soft_finish"].update({
+        "model_path": SF_MODEL_PATH,
+        "num_boost_round": int(num_boost_round_sf),
+        "feature_cols": FEAT_COLS_SF,
+        "categorical_cols": cat_used_sf,
+        "cat_categories": {c: [str(x) for x in cats] for c, cats in cat_categories_sf.items()},
+        # stage-today で同じ caps を使うため
+        "winsor": {
+            "q_low":  WINSOR_Q_LOW, "q_high": WINSOR_Q_HIGH,
+            "lo": float(lo), "hi": float(hi)
+        }
+    })
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+
+    print(f"[INFO] Soft-Finish モデル/メタを保存しました: {SF_MODEL_PATH}")
+except Exception as e:
+    print(f"[WARN] Soft-Finishの最終学習/保存で警告: {e}")
+
+print("→ 以降の LightGBM（二値・単勝確率）の学習は、追加済みの 'feat_soft_finish' を含む feature_cols でそのまま実行されます。")
+
+
+# ------------------------
+# Cell-5: LightGBM 学習（単勝的中率＝binary, Optuna反映版）
+# ------------------------
+print("\n--- Cell-5: LightGBM学習（単勝的中率＝binary / Optuna最適化パラメータ反映） ---")
+
+# 万一 'feat_soft_finish' が FEATURES に未追加なら注入（存在チェック付き）
+if "feat_soft_finish" in train.columns and "feat_soft_finish" not in FEATURES:
+    FEATURES.append("feat_soft_finish")
+
+# 学習/検証データの抽出
+X_tr = train[FEATURES].copy(); y_tr = train["y_win"].astype("int8").values
+X_va = valid[FEATURES].copy(); y_va = valid["y_win"].astype("int8").values
+
+# カテゴリ列: 存在確認しつつ category 型を担保
+cat_cols_exist = [c for c in (cat_cols_final if 'cat_cols_final' in globals() else []) if c in X_tr.columns]
+for c in cat_cols_exist:
+    for _df in (X_tr, X_va):
+        if _df[c].dtype.name != "category":
+            _df[c] = _df[c].astype("category")
+
+pos_rate = float(y_tr.mean())
+print(f"   - pos_rate={pos_rate:.4f} ({pos_rate*100:.2f}%)")
+
+# ====== ベース設定（安全系・共通フラグ） ======
+base_params = {
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "boosting_type": "gbdt",
+    "seed": SEED,
+    "first_metric_only": True,
+    "force_col_wise": True,   # メモリ安定
+    "verbosity": -1,
+    "num_threads": -1,
+    "max_bin": 255,
+    # （必要なら）決定論を強めたい時は下を有効化
+    # "deterministic": True,
+}
+
+# ====== Optunaで得た最適化パラメータ（そのまま固定） ======
+optuna_best = {
+    "learning_rate": 0.05918612051715358,
+    "num_leaves": 42,
+    "min_data_in_leaf": 179,
+    "feature_fraction": 0.8789678670695426,
+    "bagging_fraction": 0.9262282927649069,
+    "bagging_freq": 7,
+    "lambda_l1": 3.263184015661723,
+    "lambda_l2": 0.0034617269200193494,
+    "min_gain_to_split": 0.016927260477654776,
+    "feature_fraction_bynode": 0.6790387697880631,
+}
+
+# 再現性用シード（bagging/feature_fraction系にも適用）
+seed_ext = {
+    "feature_fraction_seed": SEED,
+    "bagging_seed": SEED,
+    "data_random_seed": SEED,
+}
+
+lgb_params = {**base_params, **optuna_best, **seed_ext}
+
+# LightGBM Dataset 構築
+lgb_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_cols_exist, free_raw_data=False)
+lgb_va = lgb.Dataset(X_va, label=y_va, categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
+
+# コールバック
+callbacks = [
+    lgb.early_stopping(stopping_rounds=200, verbose=True),
+    lgb.log_evaluation(period=100)
+]
+
+print("[INFO] 使用パラメータ（要約）:")
+_show = {k: lgb_params[k] for k in [
+    "learning_rate","num_leaves","min_data_in_leaf","feature_fraction","feature_fraction_bynode",
+    "bagging_fraction","bagging_freq","lambda_l1","lambda_l2","min_gain_to_split"
+] if k in lgb_params}
+print(_show)
+
+# 学習（ESで自動的にbest_iterationを決定）
+model = lgb.train(
+    params=lgb_params,
+    train_set=lgb_tr,
+    valid_sets=[lgb_tr, lgb_va],
+    valid_names=["train","valid"],
+    num_boost_round=5000,
+    callbacks=callbacks,
+)
+
+best_iter = model.best_iteration or model.current_iteration()
+print(f"   - best_iter = {best_iter}  （Optuna再検証の目安 ≈ 80）")
+
+
+# ────────────────────────────────────────────────
+# Cell-X : OOF（raw_logit）+ レース内 softmax + 温度スケーリング + 確率評価
+# ────────────────────────────────────────────────
+print("\n" + "="*50)
+print("◎ OOF予測・softmax較正・温度スケーリング（Stage-C 単勝）")
+print("="*50)
+
+import os, json
+import numpy as np
+import pandas as pd
+import lightgbm as lgb
+from sklearn.model_selection import KFold, TimeSeriesSplit
+from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
+from scipy.optimize import minimize
+
+# ---- 既存オブジェクトを取得（環境差を吸収） -----------------------
+def _get_feature_cols():
+    if 'feature_cols' in globals(): return feature_cols
+    if 'FEATURES' in globals():     return FEATURES
+    raise RuntimeError("[FATAL] feature_cols / FEATURES が見つかりません。")
+
+def _get_cat_cols():
+    for name in ('cat_cols_final','cat_cols','categorical_cols'):
+        if name in globals():
+            return globals()[name]
+    return []  # 無ければ空でOK
+
+def _get_model_and_best_iter():
+    for name in ('model','gbm_final','gbm'):
+        if name in globals():
+            m = globals()[name]
+            bi = getattr(m, 'best_iteration', None)
+            return m, (int(bi) if bi is not None else None)
+    raise RuntimeError("[FATAL] 学習済み LightGBM モデルが見つかりません（model / gbm_final / gbm）。")
+
+FEATURE_COLS = _get_feature_cols()
+CAT_COLS     = _get_cat_cols()
+TARGET       = 'y_win'
+BET_UNIT     = BET_UNIT if 'BET_UNIT' in globals() else 100
+
+# ---- レース内 softmax（数値安定化） -------------------------------
+def _group_ids(df, keys=("date","race_code")):
+    # groupキーを高速に整数ID化
+    gser = df[list(keys)].agg(tuple, axis=1)
+    _, gid = np.unique(gser.values, return_inverse=True)
+    return gid  # 0..G-1
+
+def _softmax_by_group(raw_logit, gid, T=1.0):
+    # raw_logit: 1次元 np.array（logit=raw_score）
+    # gid: 0..G-1 の整数グループID
+    eps = 1e-15
+    z = raw_logit / max(T, eps)
+    # group 内で max を引いて exp
+    # ここで group-wise に安定化
+    zmax = np.zeros_like(z)
+    # zmax[g] = max(z in group g)
+    # ベクトルでやるために、各groupの最大を先に求めてブロードキャスト
+    n = len(z)
+    gmax = np.full(gid.max()+1, -np.inf, dtype=np.float64)
+    np.maximum.at(gmax, gid, z)                 # gmax[g] = max(z[gid==g])
+    zmax = gmax[gid]
+    ex = np.exp(z - zmax)
+    gsum = np.zeros_like(gmax)
+    np.add.at(gsum, gid, ex)                    # gsum[g] = sum(exp(z[gid==g]))
+    denom = gsum[gid]
+    p = ex / np.clip(denom, eps, None)
+    # 数値安全にクリップ
+    return np.clip(p, eps, 1 - eps).astype('float64')
+
+# ---- multiclass（レース内）NLLで温度を学習 -------------------------
+def _learn_temperature_softmax(raw_logit, y, gid):
+    # レース毎に1頭だけ y=1 であることを仮定（単勝）
+    # 目的: -mean(log P_winner)，P = softmax(logit/T)
+    def nll(theta):
+        T = float(theta[0])
+        if T <= 0.0: return 1e9
+        p = _softmax_by_group(raw_logit, gid, T=T)
+        # 勝ち馬行のみ抽出（multiclass NLL相当）
+        pw = p[y.astype(bool)]
+        if pw.size == 0:
+            return 1e9
+        return -np.mean(np.log(pw))
+    res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)], method='L-BFGS-B')
+    return float(res.x[0]), float(res.fun)
+
+# ---- OOF（raw_logit）作成 ------------------------------------------
+from sklearn.model_selection import KFold, TimeSeriesSplit
+import numpy as np, gc, lightgbm as lgb
+
+N_SPLITS = int(os.environ.get("STAGEC_OOF_K", 3))
+USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルトを TimeSeriesSplit に変更（リーク対策）
+print(f"[INFO] OOFを作成します: n_splits={N_SPLITS} / splitter={'TimeSeriesSplit' if USE_TSS else 'KFold'}")
+splitter = TimeSeriesSplit(n_splits=N_SPLITS) if USE_TSS else KFold(n_splits=N_SPLITS, shuffle=False)
+
+oof_logit = np.zeros(len(train), dtype='float64')  # raw_score（logit）を格納
+best_iters = []
+
+# 1) 学習パラメータのベースを拾う（無ければデフォルト）
+def _pick_lgb_params():
+    for k in ("lgb_params", "params", "PARAMS_BASE"):
+        if k in globals() and isinstance(globals()[k], dict):
+            return globals()[k]
+    return {
+        "objective": "binary",
+        "metric": "binary_logloss",
+        "learning_rate": 0.05,
+        "num_leaves": 64,
+        "seed": 42,
+        "verbosity": -1,
+    }
+
+_lgb_base = _pick_lgb_params()
+
+# 2) 浅いコピー → OOF向けの上書き（分散化パッチ）
+params_oof = _lgb_base.copy()          # ← dict(_lgb_base) でもOK（浅いコピー）
+params_oof.update({
+    "objective": "binary",
+    "metric": "binary_logloss",
+    "first_metric_only": True,
+
+    # 重要度の“割れ過ぎ”抑制（多様性UP、精度は通常ほぼ維持）
+    "feature_fraction": 0.80,
+    "feature_fraction_bynode": 0.60,   # v3+ 相当で有効
+    "bagging_fraction": 0.80,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "min_gain_to_split": 1e-4,
+
+    # 再現性
+    "deterministic": True,
+    "num_threads": -1,
+})
+# seed類がベースに無い場合のフォールバック
+for k in ("feature_fraction_seed", "bagging_seed", "data_random_seed", "seed"):
+    params_oof.setdefault(k, 42)
+
+# 3) Dataset 構築にも一貫パラメータを渡す（max_bin/two_round/data_random_seedなど）
+_dataset_params = {k: params_oof[k] for k in [
+    "max_bin", "min_data_in_bin", "two_round", "data_random_seed",
+    "force_col_wise", "histogram_pool_size", "bin_construct_sample_cnt",
+    "max_cat_to_onehot", "max_cat_threshold", "min_data_per_group",
+    "cat_l2", "cat_smooth"
+] if k in params_oof}
+
+print("[INFO] OOF LightGBM パラメータ（要約）:", {
+    k: params_oof.get(k) for k in
+    ["objective","metric","learning_rate","num_leaves","feature_fraction","feature_fraction_bynode","bagging_fraction","lambda_l2"]
+    if k in params_oof
+})
+
+for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
+    print(f"  - Fold {fold}/{N_SPLITS}")
+
+    X_tr = train.iloc[tr_idx][FEATURE_COLS]
+    y_tr = train.iloc[tr_idx][TARGET].astype('int8').values
+    X_va = train.iloc[va_idx][FEATURE_COLS]
+    y_va = train.iloc[va_idx][TARGET].astype('int8').values
+
+    d_tr = lgb.Dataset(
+        X_tr, label=y_tr,
+        categorical_feature=CAT_COLS,
+        params=_dataset_params,
+        free_raw_data=False
+    )
+    d_va = lgb.Dataset(
+        X_va, label=y_va,
+        categorical_feature=CAT_COLS,
+        reference=d_tr,
+        params=_dataset_params,
+        free_raw_data=False
+    )
+
+    fold_model = lgb.train(
+        params_oof, d_tr,
+        num_boost_round=5000,
+        valid_sets=[d_va],
+        valid_names=['valid_fold'],
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=50, verbose=False),
+            lgb.log_evaluation(period=0),
+        ]
+    )
+
+    # raw_score=True → ロジット（margin）を取得
+    oof_logit[va_idx] = fold_model.predict(
+        X_va, num_iteration=fold_model.best_iteration, raw_score=True
+    )
+    best_iters.append(int(fold_model.best_iteration or 100))
+
+    # メモリ解放
+    del d_tr, d_va, X_tr, X_va, y_tr, y_va, fold_model
+    gc.collect()
+
+print(f"[INFO] OOF（raw_logit）完了: shape={oof_logit.shape}  / best_iter(median/mean)={np.median(best_iters):.0f}/{np.mean(best_iters):.1f}")
+
+
+
+# ---- 学習済み最終モデルの raw_logit を取得（Valid/Test） -------------
+model, best_iter = _get_model_and_best_iter()
+valid_logit = model.predict(valid[FEATURE_COLS], num_iteration=best_iter, raw_score=True)
+test_logit  = model.predict(test[FEATURE_COLS],  num_iteration=best_iter, raw_score=True)
+
+# ---- 温度Tを multiclass-NLL（レース内 softmax）で学習 ----------------
+gid_tr = _group_ids(train, ("date","race_code"))
+gid_va = _group_ids(valid, ("date","race_code"))
+y_tr   = train[TARGET].astype('int8').values
+y_va   = valid[TARGET].astype('int8').values
+
+# 学習の安定化のため OOF+Valid を併合
+p_for_T_logit = np.concatenate([oof_logit, valid_logit])
+g_for_T       = np.concatenate([gid_tr, gid_va])
+y_for_T       = np.concatenate([y_tr, y_va])
+
+T_star, nll_star = _learn_temperature_softmax(p_for_T_logit, y_for_T, g_for_T)
+print(f"[INFO] 学習した温度: T={T_star:.4f}  (multiclass NLL={nll_star:.5f})")
+
+# ---- softmax（T=1 と T=T_star）で確率化 ------------------------------
+def _probs_from_logit(df, raw_logit, T):
+    gid = _group_ids(df, ("date","race_code"))
+    return _softmax_by_group(raw_logit.astype('float64'), gid, T=T)
+
+# raw（T=1.0）
+train_prob_raw = _probs_from_logit(train, oof_logit,     T=1.0)
+valid_prob_raw = _probs_from_logit(valid, valid_logit,  T=1.0)
+test_prob_raw  = _probs_from_logit(test,  test_logit,   T=1.0)
+
+# calibrated（T=T_star）
+train_prob_cal = _probs_from_logit(train, oof_logit,     T=T_star)
+valid_prob_cal = _probs_from_logit(valid, valid_logit,  T=T_star)
+test_prob_cal  = _probs_from_logit(test,  test_logit,   T=T_star)
+
+# ---- レース内合計チェック -------------------------------------------
+def _sum_by_race(df, p):
+    q = df.assign(_p=p).groupby(["date","race_code"], sort=False)["_p"].sum().quantile([0.5,0.9,1.0]).values
+    return q
+q_tr = _sum_by_race(train, train_prob_cal)
+q_va = _sum_by_race(valid, valid_prob_cal)
+q_te = _sum_by_race(test,  test_prob_cal)
+print(f"[DBG] Train(OOF) 予測合計/レース: p50={q_tr[0]:.3f}, p90={q_tr[1]:.3f}, max={q_tr[2]:.3f}")
+print(f"[DBG] Valid      予測合計/レース: p50={q_va[0]:.3f}, p90={q_va[1]:.3f}, max={q_va[2]:.3f}")
+print(f"[DBG] Test       予測合計/レース: p50={q_te[0]:.3f}, p90={q_te[1]:.3f}, max={q_te[2]:.3f}")
+
+# ---- メトリクス（LogLoss/AUC/Brier） --------------------------------
+# * logloss は通常の binary logloss（y∈{0,1}, p=softmax確率）で OK
+# * AUC は馬単位の二値AUC（参考指標）
+# * Brier は二値Brier
+def _metrics(y, p):
+    return {
+        "logloss": log_loss(y, p),               # ← eps引数は渡さない（TypeError回避）
+        "auc":     roc_auc_score(y, p),
+        "brier":   brier_score_loss(y, p)
+    }
+
+m_train_raw = _metrics(train[TARGET].values, train_prob_raw)
+m_valid_raw = _metrics(valid[TARGET].values, valid_prob_raw)
+m_test_raw  = _metrics(test[TARGET].values,  test_prob_raw)
+
+m_train_cal = _metrics(train[TARGET].values, train_prob_cal)
+m_valid_cal = _metrics(valid[TARGET].values, valid_prob_cal)
+m_test_cal  = _metrics(test[TARGET].values,  test_prob_cal)
+
+def _print_table(tag, M):
+    print(tag)
+    print("="*40)
+    print("Split      | LogLoss |   AUC   |  Brier")
+    print("-"*40)
+    for name, m in M:
+        print(f"{name:<10} | {m['logloss']:.5f} | {m['auc']:.5f} | {m['brier']:.5f}")
+    print("="*40)
+
+_print_table("\n[INFO] モデル評価（softmax後 / T=1.0）", [
+    ("Train(OOF)", m_train_raw),
+    ("Valid",      m_valid_raw),
+    ("Test",       m_test_raw),
+])
+_print_table("\n[INFO] モデル評価（温度較正後 / T*=%.4f）" % T_star, [
+    ("Train(OOF)", m_train_cal),
+    ("Valid",      m_valid_cal),
+    ("Test",       m_test_cal),
+])
+
+# ---- 出力列を統一：pred_win_prob を『較正後 softmax 確率』に確定 ----
+# 既存の pred_win_prob があれば退避
+for df_ in (train, valid, test):
+    if 'pred_win_prob' in df_.columns:
+        df_['pred_win_prob_raw_backup'] = df_['pred_win_prob'].values
+
+train['pred_win_prob'] = train_prob_cal.astype('float32')
+valid['pred_win_prob'] = valid_prob_cal.astype('float32')
+test['pred_win_prob']  = test_prob_cal.astype('float32')
+
+# ---- 温度をメタ保存（任意） ----------------------------------------
+try:
+    meta_path = globals().get('STAGE_C_META_PATH', os.path.join(ART_DIR_C, "JRA_stage_c_meta.json"))
+    if meta_path:
+        _meta = {}
+        if os.path.exists(meta_path):
+            with open(meta_path, 'r') as f: _meta = json.load(f)
+        _meta['temperature_softmax'] = float(T_star)
+        with open(meta_path, 'w') as f: json.dump(_meta, f, indent=2)
+        print(f"[INFO] 温度(T)をメタへ保存: {meta_path}")
+except Exception as e:
+    print(f"[WARN] 温度メタ保存に失敗: {e}")
+
+
+print("\n[NOTE] 以降のデシル/TSR/Top-k評価は『pred_win_prob（= softmax後・温度較正済）』を使用します。")
+
+
+
+# ---- デシル分析 ----
+def decile_table(df_src, pcol, payout_col, title):
+    df = df_src[[pcol, payout_col]].copy()
+    # 同値タイの偏りを防ぐため rank→qcut
+    r = df[pcol].rank(method="first")
+    try:
+        dec = pd.qcut(r, 10, labels=False, duplicates='drop') + 1
+    except ValueError:
+        dec = pd.qcut(r, 5, labels=False, duplicates='drop') + 1
+        dec = dec * 2
+    df['decile'] = dec.astype(int)
+    agg = df.groupby('decile').agg(
+        count=(pcol,'count'),
+        mean_prob=(pcol,'mean'),
+        hit_rate=(payout_col, lambda x: (x>0).mean()*100),
+        roi=(payout_col, lambda x: x.sum()/(len(x)*BET_UNIT)*100 if len(x)>0 else 0)
+    ).sort_index(ascending=False)
+    print(f"\n[Decile] {title} :\n{agg.to_string(float_format='%.2f')}")
+    return agg
+
+# ---- 10% 刻み確率bin ----
+def prob_bins(df_src, pcol, payout_col, title):
+    bins = np.linspace(0,1,11)
+    cut = pd.cut(df_src[pcol], bins, include_lowest=True)
+    agg = df_src.groupby(cut).agg(
+        count=(pcol,'count'),
+        avg_pred=(pcol,'mean'),
+        emp_rate=(payout_col, lambda x: (x>0).mean()*100),
+        roi=(payout_col, lambda x: x.sum()/(len(x)*BET_UNIT)*100 if len(x)>0 else 0)
+    )
+    print(f"\n[ProbBins] {title} (10%刻み)\n{agg.to_string(float_format='%.2f')}")
+    return agg
+
+# ---- Top-k per Race ROI ----
+def roi_topk_per_race(df_src, pcol, payout_col, k=1):
+    g = df_src.sort_values(pcol, ascending=False).groupby(["date","race_code"], sort=False)
+    topk = g.head(k)
+    n = len(topk)
+    if n == 0:
+        return 0.0, 0
+    roi = topk[payout_col].sum()/(n*BET_UNIT)*100
+    return float(roi), int(n)
+
+# === TSR（trifecta_support_rate）× Pred の“バリュー”可視化（追加関数） ===
+
+def _normalize_tsr_prob(df, tsr_col="trifecta_support_rate", group_keys=("date","race_code")):
+    """レース内でTSRを正規化（合計1.0）→勝率っぽいスケールに合わせる"""
+    if tsr_col not in df.columns:
+        return None
+    g = df[list(group_keys)].apply(tuple, axis=1)
+    s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).astype("float32")
+    denom = s.groupby(g).transform("sum").replace(0, np.nan)
+    tsr_prob = (s / denom).fillna(0.0).astype("float32")
+    return tsr_prob
+
+def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_support_rate", gap_ths=(0.0, 0.02, 0.05)):
+    """
+    既存のデシルと同じ切り方で、TSR関連の指標を追加表示。
+    - mean_tsr_prob: 市場（TSR）の平均“人気確率”
+    - mean_value_gap: 予測勝率 - 市場確率（+ほど割安）
+    - share_value_pos: gap>0（割安）馬の比率[%]
+    - roi_value_gap>=Xbp: gapが閾値以上のみ買った時の回収率（Xはbasis points）
+    併せて、各デシルの bets（件数）も出す。
+    """
+    if tsr_col not in df_src.columns:
+        print(f"[TSR] '{tsr_col}' が無いのでTSR分析をスキップします。")
+        return None
+
+    cols_need = [pcol, payout_col, tsr_col, "date", "race_code"]
+    miss = [c for c in cols_need if c not in df_src.columns]
+    if miss:
+        print(f"[TSR] 必要列が足りません: {miss} → スキップ")
+        return None
+
+    df = df_src[cols_need].copy()
+
+    # レース内TSR正規化（確率スケール：合計1）
+    gkey = df[["date","race_code"]].apply(tuple, axis=1)
+    s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).astype("float32")
+    denom = s.groupby(gkey).transform("sum").replace(0, np.nan)
+    df["tsr_prob"] = (s / denom).fillna(0.0).astype("float32")
+
+    # 既存デシル（rank→qcut）
+    r = df[pcol].rank(method="first")
+    try:
+        dec = pd.qcut(r, 10, labels=False, duplicates='drop') + 1
+    except ValueError:
+        dec = pd.qcut(r, 5, labels=False, duplicates='drop') + 1
+        dec = dec * 2
+    df["decile"] = dec.astype(int)
+
+    # “バリュー” = 予測 - 市場
+    df["value_gap"] = (df[pcol] - df["tsr_prob"]).astype("float32")
+
+    # 基本集計（まず昇順で作ってから最後に降順へ）
+    agg = df.groupby("decile").agg(
+        count=("date","count"),
+        mean_pred=(pcol,"mean"),
+        mean_tsr_prob=("tsr_prob","mean"),
+        mean_value_gap=("value_gap","mean"),
+        share_value_pos=("value_gap", lambda x: (x>0).mean()*100),
+    ).sort_index(ascending=True)
+
+    # gap閾値ごとに ROI と bets を index 対応で join（←ここが重要）
+    for th in gap_ths:
+        bp = int(round(th * 10000))  # basis points 表示
+        lab_roi  = f"roi_value_gap>={bp}bp"
+        lab_bets = f"bets_gap>={bp}bp"
+
+        mask = (df["value_gap"] >= th)
+        grp  = df[mask].groupby("decile")
+        roi_by_dec  = grp[payout_col].apply(lambda x: (x.sum() / (len(x)*BET_UNIT) * 100) if len(x)>0 else 0.0)
+        bets_by_dec = grp.size()
+
+        agg = agg.join(roi_by_dec.rename(lab_roi),  how="left")
+        agg = agg.join(bets_by_dec.rename(lab_bets), how="left")
+
+    # 表示は降順(D10→D1)
+    agg = agg.fillna(0.0).sort_index(ascending=False)
+
+    print(f"\n[TSR×Pred] {title}（デシル別・市場比較）:")
+    print(agg.to_string(float_format="%.2f"))
+
+    # 全体での gap フィルタ回収率
+    for th in gap_ths:
+        sub = df[df["value_gap"] >= th]
+        bets = len(sub)
+        roi = sub[payout_col].sum()/(bets*BET_UNIT)*100 if bets>0 else 0.0
+        print(f"   - 全体: gap≥{th:.3f} → ROI={roi:.2f}%  bets={bets}")
+
+    # gapフィルタ下のレース内Top-k ROI（index整合は不要）
+    def _roi_topk_value(df_sub, k, th):
+        g = df_sub[df_sub["value_gap"]>=th].sort_values(pcol, ascending=False).groupby(["date","race_code"], sort=False)
+        pick = g.head(k)
+        n = len(pick)
+        roi = pick[payout_col].sum()/(n*BET_UNIT)*100 if n>0 else 0.0
+        return roi, n
+
+    for th in gap_ths:
+        for k in (1, 2):
+            r_, n_ = _roi_topk_value(df, k, th)
+            print(f"   - [Value gap≥{th:.3f}] Top{k}/race: ROI={r_:.2f}%  bets={n_}")
+
+    return agg
+
+
+
+va_dec = decile_table(valid, "pred_win_prob", "win_payout", "Valid")
+te_dec = decile_table(test,  "pred_win_prob", "win_payout", "Test")
+va_bins = prob_bins(valid, "pred_win_prob", "win_payout", "Valid")
+te_bins = prob_bins(test,  "pred_win_prob", "win_payout", "Test")
+
+r1_v, n1_v = roi_topk_per_race(valid, "pred_win_prob", "win_payout", 1)
+r2_v, n2_v = roi_topk_per_race(valid, "pred_win_prob", "win_payout", 2)
+r1_t, n1_t = roi_topk_per_race(test,  "pred_win_prob", "win_payout", 1)
+r2_t, n2_t = roi_topk_per_race(test,  "pred_win_prob", "win_payout", 2)
+print(f"\n-- Top-k per Race --\n[Top1/race] Valid ROI={r1_v:.2f}% bets={n1_v} | [Top2/race] ROI={r2_v:.2f}% bets={n2_v}")
+print(f"[Top1/race] Test ROI={r1_t:.2f}% bets={n1_t} | [Top2/race] ROI={r2_t:.2f}% bets={n2_t}")
+
+print("\n=== TSR add-on (model vs market) ===")
+_ = decile_table_tsr_ex(valid, "pred_win_prob", "win_payout", title="Valid", tsr_col="trifecta_support_rate", gap_ths=(0.0, 0.02, 0.05))
+_ = decile_table_tsr_ex(test,  "pred_win_prob", "win_payout", title="Test",  tsr_col="trifecta_support_rate", gap_ths=(0.0, 0.02, 0.05))
+
+# ------------------------
+# Cell-6.5: リークっぽさの自動検知（任意停止）
+# ------------------------
+if STRICT_LEAK_GUARD:
+    try:
+        top_dec_va = float(va_dec.iloc[0]['hit_rate']) if not va_dec.empty else 0.0
+        top_dec_te = float(te_dec.iloc[0]['hit_rate']) if not te_dec.empty else 0.0
+        if (top_dec_va > 40.0 and top_dec_te > 40.0):
+            raise RuntimeError(
+                f"[LEAK-GUARD] Topデシルの的中率が異常に高い可能性があります (Valid={top_dec_va:.1f}%, Test={top_dec_te:.1f}%).\n"
+                f"Stage-A/オッズ由来の確定情報（確定人気/最終オッズ）や配当列が混入していないか確認してください。"
+            )
+    except Exception as e:
+        raise
+
+# ------------------------
+# Cell-7: 成果物保存
+# ------------------------
+print("\n--- Cell-7: 成果物を書き出します ---")
+# 予測ファイル（valid+test）
+try:
+    out = pd.concat([
+        valid[MERGE_KEYS + ["pred_win_prob"]].assign(split="valid"),
+        test[MERGE_KEYS + ["pred_win_prob"]].assign(split="test")
+    ], ignore_index=True)
+    out_path = os.path.join(ART_DIR_C, "JRA_stage_c_predictions.parquet")
+    out.to_parquet(out_path, index=False, engine="pyarrow", compression="zstd")
+    print(f"   - 予測書き出し:  {out_path}  rows= {len(out):,}")
+except Exception as e:
+    print(f"   - [WARN] 予測の書き出しに失敗: {e}")
+
+# メタ（既存を保持しつつ必要項目だけ上書き）
+meta_path = os.path.join(ART_DIR_C, "JRA_stage_c_meta.json")
+
+# 既存メタを読み込み（無ければ空dict）
+_meta = {}
+if os.path.exists(meta_path):
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            _meta = json.load(f)
+    except Exception:
+        _meta = {}
+
+# 今回更新するキーだけ上書き
+_meta.update({
+    "seed": SEED,
+    "train_range": [str(TRAIN_START_DATE.date()), str(TRAIN_END_DATE.date())],
+    "valid_range": [str(VALID_START_DATE.date()), str(VALID_END_DATE.date())],
+    "test_range":  [str(TEST_START_DATE.date()),  str(TEST_END_DATE.date())],
+    "features": FEATURES,
+    "categorical_features": cat_cols_final,
+    "best_iter": int(best_iter),
+    "cov": probe,
+})
+
+# 保存（既存の soft_finish / temperature_softmax は保持される）
+with open(meta_path, "w", encoding="utf-8") as f:
+    json.dump(_meta, f, ensure_ascii=False, indent=2)
+print(f"   - META 保存:  {meta_path}")
+
+
+print("\n✅ Stage-C 完了（単勝的中率モデル / 厳格マージ＆停止ガード）")
+
+# --- Stage-C: pred_win_prob を必ず用意するためのドロップイン・パッチ（※原文そのまま残置） ---
+# ※ 上で Train/Valid/Test すべてに pred_win_prob を作成済みなので、このパッチは基本的に何もしません
+#    （列が無い場合の保険・値域チェック・DBG出力のみ動作）
+import re, numpy as np
+import pandas as pd
+import lightgbm as lgb
+
+# 1) 使う特徴量リストを特定（FEATURESがなければ代替）
+if 'FEATURES' in globals():
+    FEATS = FEATURES
+elif 'feature_cols' in globals():
+    FEATS = feature_cols
+else:
+    _exclude = set([
+        # キー・目的・明確なリーク列
+        'date','race_code','horse_number','race_number',
+        'win_flag','win_payout','place_payout',
+        'target','target_raw','target_capped',
+        'pred_ev_stage_b_oof','pred_ev_stage_b_pred','pred_ev_stage_b_any',
+    ])
+    # 数値主体で暫定抽出
+    FEATS = [c for c in valid.columns if c not in _exclude and pd.api.types.is_numeric_dtype(valid[c])]
+
+# 2) Booster を取得
+_booster = None
+for cand in ('model','gbm','gbm_final','clf'):
+    if cand in globals() and isinstance(globals()[cand], lgb.Booster):
+        _booster = globals()[cand]; break
+if _booster is None:
+    raise RuntimeError("LightGBM Booster が見つかりません。学習セルの実行順を確認してください。")
+
+_best_iter = getattr(_booster, 'best_iteration', None)
+
+def _ensure_pred_col(df, name='pred_win_prob'):
+    """name列がなければ予測して作成。存在しても値域を点検して補正。"""
+    if name not in df.columns:
+        # 既存の“それっぽい”列があれば流用（最優先：pred_win_prob）
+        cand = None
+        for c in df.columns:
+            if c == 'pred_win_prob':
+                cand = c; break
+        # “pred_*prob*” のような列名があれば候補にする（Stage-Aの prob_gap_* は除外）
+        if cand is None:
+            pats = (r'^pred.*prob', r'pred.*proba', r'^proba$', r'^pred$')
+            bad  = ('prob_gap', 'pred_prob_stage_a')  # 明確に別物
+            for c in df.columns:
+                if any(re.search(p, c) for p in pats) and not any(b in c for b in bad):
+                    cand = c; break
+
+        if cand is not None:
+            s = pd.to_numeric(df[cand], errors='coerce')
+            df[name] = s
+        else:
+            # 予測して作る（通常は到達しない）
+            X = df[FEATS].copy()
+            _num_cols = [c for c in FEATS if pd.api.types.is_float_dtype(X[c])]
+            if _num_cols:
+                X.loc[:, _num_cols] = X.loc[:, _num_cols].astype('float32', copy=False)
+            p = _booster.predict(X, num_iteration=_best_iter, raw_score=False)
+            df[name] = pd.Series(p, index=df.index)
+
+    # 値域・形式チェック（logit っぽければシグモイド）
+    p = pd.to_numeric(df[name], errors='coerce').astype('float64')
+    if (p.min() < 0.0) or (p.max() > 1.0):
+        if p.min() < -5 or p.max() > 5:
+            p = 1.0 / (1.0 + np.exp(-p))
+        p = np.clip(p, 0.0, 1.0)
+    df[name] = p.astype('float32')
+
+# 3) 各分割に適用（上流で作成済みなら値域チェックのみ）
+for _df in (train, valid, test):
+    _ensure_pred_col(_df, name='pred_win_prob')
+
+# 4) 追加の健全性チェック（任意）
+for _name, _df in [('Train', train), ('Valid', valid), ('Test', test)]:
+    p = _df['pred_win_prob'].to_numpy(dtype='float32')
+    assert np.isfinite(p).all(), f"{_name}: pred_win_prob に NaN/Inf が含まれます。"
+    if not (0.0 <= p.min() <= p.max() <= 1.0):
+        raise RuntimeError(f"{_name}: pred_win_prob の値域が [0,1] 外です。作成手順を確認してください。")
+    # レース内合計の参考値
+    if {'date','race_code'}.issubset(_df.columns):
+        s = _df.groupby(['date','race_code'], sort=False)['pred_win_prob'].sum()
+        print(f"[DBG] {_name} 予測合計/レース: p50={s.median():.3f}, p90={s.quantile(.9):.3f}, max={s.max():.3f}")
+
+
+def top1_margin_report(df, pcol="pred_win_prob", payout_col="win_payout",
+                       bins=(0.00, 0.02, 0.05, 0.10, 0.20, 0.30, 1.01), name="Valid"):
+    # レース内で上位2頭を抽出
+    g = df.sort_values(pcol, ascending=False).groupby(["date","race_code"], sort=False)
+    top2 = g.head(2).copy()
+    top2["__rank"] = top2.groupby(["date","race_code"])[pcol].rank(method="first", ascending=False)
+
+    p1 = top2[top2["__rank"]==1].copy()
+    p2 = (top2[top2["__rank"]==2][["date","race_code", pcol]]
+            .rename(columns={pcol:"p2"}))
+    p1 = p1.merge(p2, on=["date","race_code"], how="left")
+    p1["p2"] = p1["p2"].fillna(0.0)
+    p1["margin"] = (p1[pcol] - p1["p2"]).astype("float32")
+
+    # bin化（右開区間にするため right=False）
+    import numpy as np, pandas as pd
+    bins = list(bins)
+    labels = [f"[{bins[i]:.2f},{bins[i+1]:.2f})" for i in range(len(bins)-1)]
+    p1["margin_bin"] = pd.cut(p1["margin"], bins=bins, labels=labels, right=False, include_lowest=True)
+
+    def _roi(x):
+        n = len(x)
+        return 0.0 if n==0 else x.sum()/(n*BET_UNIT)*100.0
+
+    out = (p1.groupby("margin_bin")
+             .agg(races=("date","count"),
+                  top1_avg_p=(pcol, "mean"),
+                  margin_avg=("margin","mean"),
+                  top1_hit_rate=(payout_col, lambda x: (x>0).mean()*100.0),
+                  top1_roi=(payout_col, _roi))
+             .reset_index())
+
+    print(f"\n[Top1 成績 by マージン] {name}")
+    print(out.to_string(index=False, float_format="%.2f"))
+    return out
+
+# 実行例
+_ = top1_margin_report(valid, name="Valid")
+_ = top1_margin_report(test,  name="Test")
+
+
+# --- Cell-X2: 特徴量重要度 Top50（Stage-C / LightGBM） ---
+import os, json, re
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 保存先（JRA06固定）
+STAGE_C_ART_DIR = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c"
+os.makedirs(STAGE_C_ART_DIR, exist_ok=True)
+FI_CSV_PATH = os.path.join(STAGE_C_ART_DIR, "JRA_stage_c_feature_importance.csv")
+
+# 1) Booster を取得
+booster = None
+for cand in ["model", "gbm_final", "bst"]:
+    if cand in globals() and hasattr(globals()[cand], "feature_importance"):
+        booster = globals()[cand]
+        print(f"[INFO] Booster 検出: {cand}")
+        break
+if booster is None:
+    raise RuntimeError("LightGBM の学習済みモデル（model / gbm_final / bst）が見つかりません。学習セルの直後で実行してください。")
+
+# 2) 重要度をDataFrame化（gain / split 両方）
+feat_names = booster.feature_name()
+fi_gain  = booster.feature_importance(importance_type="gain")
+fi_split = booster.feature_importance(importance_type="split")
+fi = pd.DataFrame({"feature": feat_names, "gain": fi_gain, "split": fi_split})
+fi["gain_norm"] = fi["gain"] / (fi["gain"].sum() + 1e-12)
+fi = fi.sort_values("gain", ascending=False).reset_index(drop=True)
+
+# 3) 表示：Top 50
+topn = 50
+print("\n[Feature Importance] Top 50 by GAIN")
+disp = fi.head(topn).copy()
+# 見やすいように丸め
+disp["gain_norm"] = disp["gain_norm"].map(lambda x: f"{x:.4f}")
+disp["gain"] = disp["gain"].map(lambda x: f"{x:.1f}")
+print(disp.to_string(index=False))
+
+# 4) CSV保存（上位200も併せて保存）
+fi.head(200).to_csv(FI_CSV_PATH, index=False)
+print(f"\n[SAVE] 重要度CSVを書き出しました: {FI_CSV_PATH}")
+
+# 5) 可視化：水平バー（Top 50）
+plt.figure(figsize=(10, max(6, int(0.22*len(disp)))))
+plt.barh(disp["feature"][::-1], disp["gain"].astype(float)[::-1])
+plt.xlabel("gain")
+plt.ylabel("feature")
+plt.title("Stage-C Feature Importance (Top 50 by gain)")
+plt.tight_layout()
+plt.show()
+
+# 6) 簡易リークスキャン（疑わしいトークンが上位にいないかを目視補助）
+suspect_tokens = [
+    "odds", "payout", "trifecta_support_rate", "final", "確定", "popular", "popularity"
+]
+sus = [f for f in fi.head(topn)["feature"] if any(t in f.lower() for t in suspect_tokens)]
+if sus:
+    print("\n[LEAK-SCAN] Top50内で疑わしい特徴名（手動点検を推奨）:")
+    for s in sus:
+        print("  -", s)
+else:
+    print("\n[LEAK-SCAN] Top50内に典型的なリークトークンは見当たりません。")
