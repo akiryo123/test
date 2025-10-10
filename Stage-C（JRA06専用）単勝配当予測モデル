@@ -289,8 +289,8 @@ base_sorted = base.sort_values("date").reset_index(drop=True)
 df_all_for_guard = base_sorted.copy()
 
 # 学習・評価期間（JRA用）
-#TRAIN_START_DATE = pd.to_datetime("2016-01-01")
-TRAIN_START_DATE = pd.to_datetime("2022-01-01") #短縮版！！！！！！！！！！！！！！！！
+TRAIN_START_DATE = pd.to_datetime("2016-01-01")
+#TRAIN_START_DATE = pd.to_datetime("2022-01-01") #短縮版！！！！！！！！！！！！！！！！
 VALID_START_DATE = pd.to_datetime("2023-04-01")
 VALID_END_DATE   = pd.to_datetime("2024-03-31")
 TEST_START_DATE  = pd.to_datetime("2024-04-01")
@@ -400,10 +400,6 @@ for c in cat_cols:
             s = s.where(s.isin(cats), NA_TOKEN)  # 未知は欠損扱い
             df_[c] = pd.Categorical(s, categories=cats)
 
-train = train.reset_index(drop=True)
-valid = valid.reset_index(drop=True)
-test  = test.reset_index(drop=True)
-
 
 # 0/1 フラグ整形（object→0/1）
 flag_cols = [c for c in ["stable_transfer_flag"] if c in df_all_for_guard.columns]
@@ -503,56 +499,6 @@ for col in race_feats_src:
         _df[f"gap_{col}"] = (top - s).astype("float32")
 
 
-# ==============================================================================
-# タイトル: TSR正規化 & r_/z_ ギャップ（A↔TSR, SP↔TSR）
-# 説明: 市場(TSR)をレース内確率(tsr_prob)に正規化し、A/SPとの順位差・z差を特徴量化します。
-#       ・tsr_prob … trifecta_support_rate をレース内で合計=1に正規化
-#       ・r_tsr_prob / z_tsr_prob … tsr_prob のレース内順位/標準化スコア
-#       ・r_gap_a_tsr, z_gap_a_tsr … A(確率) vs TSR の順位差/標準化差
-#       ・r_gap_sp_tsr, z_gap_sp_tsr … SP(指数) vs TSR の順位差/標準化差
-#       ※ “r_*” は「数字が小さいほど強い（1位が最良）」ことに注意。符号は学習が吸収します。
-# ==============================================================================
-print("\n[INFO] TSR正規化 & r_/z_ギャップ（A↔TSR, SP↔TSR）を作成します…")
-_added_cols = set()
-
-for _df in (train, valid, test):
-    if "trifecta_support_rate" not in _df.columns:
-        continue
-
-    # --- 1) tsr_prob: レース内合計=1 に正規化 --------------------------------
-    gkey = _df[["date","race_code"]].apply(tuple, axis=1)
-    s = pd.to_numeric(_df["trifecta_support_rate"], errors="coerce").fillna(0.0).astype("float32")
-    denom = s.groupby(gkey).transform("sum").replace(0, np.nan)
-    _df["tsr_prob"] = (s / denom).fillna(0.0).astype("float32"); _added_cols.add("tsr_prob")
-
-    # --- 2) tsr_prob の r_/z_ -------------------------------------------------
-    sp = _df["tsr_prob"].astype(float)
-    _df["r_tsr_prob"] = sp.groupby(gkey).rank(ascending=False, method="first").astype("float32"); _added_cols.add("r_tsr_prob")
-
-    mu = _df.groupby(["date","race_code"])["tsr_prob"].transform("mean").astype("float32")
-    sd = _df.groupby(["date","race_code"])["tsr_prob"].transform("std").astype("float32").replace(0, np.nan)
-    _df["z_tsr_prob"] = ((sp - mu) / sd).astype("float32").fillna(0.0); _added_cols.add("z_tsr_prob")
-
-    # --- 3) A vs TSR のギャップ（r/z） ----------------------------------------
-    if "r_pred_prob_stage_a" in _df.columns:
-        _df["r_gap_a_tsr"] = (_df["r_pred_prob_stage_a"].astype("float32") - _df["r_tsr_prob"]).astype("float32")
-        _added_cols.add("r_gap_a_tsr")
-    if "z_pred_prob_stage_a" in _df.columns:
-        _df["z_gap_a_tsr"] = (_df["z_pred_prob_stage_a"].astype("float32") - _df["z_tsr_prob"]).astype("float32")
-        _added_cols.add("z_gap_a_tsr")
-
-    # --- 4) SP vs TSR のギャップ（r/z） ---------------------------------------
-    if "r_pred_time_index_sp" in _df.columns:
-        _df["r_gap_sp_tsr"] = (_df["r_pred_time_index_sp"].astype("float32") - _df["r_tsr_prob"]).astype("float32")
-        _added_cols.add("r_gap_sp_tsr")
-    if "z_pred_time_index_sp" in _df.columns:
-        _df["z_gap_sp_tsr"] = (_df["z_pred_time_index_sp"].astype("float32") - _df["z_tsr_prob"]).astype("float32")
-        _added_cols.add("z_gap_sp_tsr")
-
-print(f"   - 作成列: {sorted(_added_cols)}")
-# ==============================================================================
-
-
 # === New: r_*（レース内順位）群からの総合順位平均 & 偏差値 ===
 def _keep_r_col(c: str) -> bool:
     """r_* のうち ‘二重順位/派生順位’ を除外して集計対象だけを残す"""
@@ -596,37 +542,6 @@ LEAK_DROP = [
 ]
 
 FEATURES = [c for c in ALL_COLS_UNION if c not in set(LEAK_DROP + MERGE_KEYS + ["race_number","date"])]
-
-
-# ==============================================================================
-# === アイデア1-A：AIモデル間の相互作用特徴量（A×B, Aランク−SPランク） ===
-#   挿入位置：FEATURES を最終決定する直前
-# ==============================================================================
-print("\n[INFO] 相互作用特徴量(A×B, A-rank vs SP-rank) を作成します...")
-_interact_added = []
-
-for _df in (train, valid, test):
-    # 1) 「Aの確率」×「Bの期待値」
-    if "pred_prob_stage_a" in _df.columns and "pred_ev_stage_b_any" in _df.columns:
-        _df["interact_Aprob_x_Bev"] = (
-            _df["pred_prob_stage_a"].fillna(0.0).astype("float32")
-            * _df["pred_ev_stage_b_any"].fillna(0.0).astype("float32")
-        ).astype("float32")
-        _interact_added.append("interact_Aprob_x_Bev")
-
-    # 2) 「Aの確率ランク」−「SPの能力ランク」
-    #   ※ r_* は「順位（1が最良）」なので、符号の解釈に注意
-    if "r_pred_prob_stage_a" in _df.columns and "r_pred_time_index_sp" in _df.columns:
-        _df["interact_Arank_vs_SPrank"] = (
-            _df["r_pred_prob_stage_a"].astype("float32")
-            - _df["r_pred_time_index_sp"].astype("float32")
-        ).astype("float32")
-        _interact_added.append("interact_Arank_vs_SPrank")
-
-print(f"   - 新規作成: {sorted(set(_interact_added))}")
-# ==============================================================================
-
-
 
 # --- PATCH B: “万一”残っていても採用しない（恒久対応の二重安全弁） ---
 DROP_B_DUP = {"pred_ev_stage_b_oof","pred_ev_stage_b_pred"}
@@ -1000,316 +915,35 @@ except Exception as e:
 
 print("→ 以降の LightGBM（二値・単勝確率）の学習は、追加済みの 'feat_soft_finish' を含む feature_cols でそのまま実行されます。")
 
-# ────────────────────────────────────────────────
-# Cell-4.7 : サンプル重み（低配当ゲートを含む最終重み）
-#   - 目的: 低配当の勝利（例: 単勝 < 300円）の学習寄与を抑制/除外
-#   - 出力: train["__sample_weight_stage_c__"] を最終確定
-#           valid/test は 1.0（評価は素の確率指標で）
-# 環境変数:
-#   LOW_PAYOUT_MIN_YEN     ... しきい値（デフォルト=300）
-#   LOW_PAYOUT_SOFT_WIDTH  ... ソフト遷移幅（0=ハードゲート）
-# ────────────────────────────────────────────────
-print("\n" + "="*50)
-print("◎ Sample Weights build（低配当ゲート）")
-print("="*50)
-
-import numpy as np
-import pandas as pd
-import os
-
-MIN_YEN   = int(os.environ.get("LOW_PAYOUT_MIN_YEN", "300"))   # 300円未満を抑制
-SOFT_W    = int(os.environ.get("LOW_PAYOUT_SOFT_WIDTH", "0"))  # 0=ハード、それ以外=ソフト幅（例:150）
-
-def _build_low_payout_gate_weight(
-    df_tr: pd.DataFrame,
-    payout_col: str = "win_payout",
-    min_yen: int = 300,
-    soft_width: int = 0
-) -> np.ndarray:
-    """勝者だけを対象に、低配当の学習寄与を抑えるゲート（0〜1）。
-    - soft_width=0: ハード（min_yen未満は0、以上は1）
-    - soft_width>0: min_yen→min_yen+soft_width の間で 0→1 に線形遷移
-    """
-    pay = pd.to_numeric(df_tr.get(payout_col, 0), errors="coerce").fillna(0).astype("float64").values
-    gate = np.ones(len(df_tr), dtype="float64")
-    if "y_win" not in df_tr.columns:
-        raise RuntimeError("[FATAL] y_win が見つかりません。Cell-4 での目的変数作成を確認してください。")
-    m_win = (df_tr["y_win"].values == 1)
-
-    if soft_width <= 0:
-        # ハード: 単勝 < min_yen の勝利は weight=0
-        gate[m_win & (pay < float(min_yen))] = 0.0
-    else:
-        # ソフト: [min_yen, min_yen+soft_width] で 0→1 線形
-        lo, hi = float(min_yen), float(min_yen + soft_width)
-        width = max(hi - lo, 1e-9)
-        g = (pay - lo) / width
-        g = np.clip(g, 0.0, 1.0)
-        gate[m_win] = g[m_win]
-
-    return gate
-
-# 既存の重みがあればそれに掛け算、なければゲートのみで初期化
-W_gate = _build_low_payout_gate_weight(train, payout_col="win_payout", min_yen=MIN_YEN, soft_width=SOFT_W)
-
-if "__sample_weight_stage_c__" in train.columns:
-    base_w = pd.to_numeric(train["__sample_weight_stage_c__"], errors="coerce").fillna(1.0).astype("float64").values
-    W_final = (base_w * W_gate).astype("float64")
-else:
-    W_final = W_gate.astype("float64")
-
-# 最終重みを列として保存（学習で使用）
-train["__sample_weight_stage_c__"] = W_final.astype("float32")
-
-# 参考: valid/test は評価だけなので 1.0 にしておく（既に列があるなら欠損を1.0で埋め）
-for _df in (valid, test):
-    if "__sample_weight_stage_c__" not in _df.columns:
-        _df["__sample_weight_stage_c__"] = 1.0
-    else:
-        _df["__sample_weight_stage_c__"] = pd.to_numeric(_df["__sample_weight_stage_c__"], errors="coerce").fillna(1.0).astype("float32")
-
-# サマリ出力
-def _wstat(name, w):
-    w = np.asarray(w, dtype="float64")
-    print(f" - {name:<12} mean={w.mean():.4f}  min={w.min():.3f}  p50={np.quantile(w,0.5):.3f}  p90={np.quantile(w,0.9):.3f}  max={w.max():.1f}")
-
-print("[Weights Summary]")
-_wstat("gate(lowP)", W_gate)
-_wstat("FINAL(train)", train["__sample_weight_stage_c__"].values)
-print("（valid/test は 1.0 固定）")
-
-
-# Title: FEATURES 統一の安全エイリアス
-# Description: どちらか片方の変数名しか無い環境でもズレないようにする（最終的に FEATURES を一本化）
-if 'FEATURES' not in globals() and 'feature_cols' in globals():
-    FEATURES = feature_cols[:]  # ← コピーで受ける
-elif 'FEATURES' in globals() and 'feature_cols' in globals():
-    # 片方にしか無い列が混じっていないか簡易チェック（任意）
-    pass
-
-# Title: 市場“生値”の直接使用を停止（A / A+）
-# Description: trifecta_support_rate, tsr_prob と popularity/odds 文字列を含む列を学習から落とす
-_before = len(FEATURES)
-DROP_KEYS = ("popularity", "odds")
-FEATURES = [c for c in FEATURES
-            if c != "trifecta_support_rate"   # A
-            and c != "tsr_prob"               # A+（相対: z_tsr_prob 等は残す）
-            and not any(k in c for k in DROP_KEYS)]  # A+（市場痕跡の代理）
-print(f"[PATCH-A/A+] features: {_before} -> {len(FEATURES)} "
-      f"(drop trifecta_support_rate, tsr_prob, *popularity*, *odds*)")
-
-# Title: CAND 閾値系の一時外し（C）
-# Description: exclude_margin_* は “安全側バイアス” が強く ROI を押し下げやすいので検証目的で外す
-_sus = [c for c in FEATURES if c.startswith("exclude_margin_")]
-if _sus:
-    FEATURES = [c for c in FEATURES if c not in _sus]
-    print(f"[PATCH-C] drop suspects: {_sus}")
-
-# （念のため）存在確認
-_missing = [c for c in FEATURES if c not in train.columns]
-assert not _missing, f"FEATURES中に存在しない列があります: {_missing[:5]}"
-
-# タイトル: 市場生値の直接使用を停止（FEATURESへ確実適用）
-# 説明: 'trifecta_support_rate' / 'tsr_prob' / '*popularity*' / '*odds*' を FEATURES から除外
-
-_before = len(FEATURES)
-DROP_KEYS = ("popularity", "odds")
-
-FEATURES = [
-    c for c in FEATURES
-    if (c != "trifecta_support_rate")
-    and (c != "tsr_prob")
-    and not any(k in c for k in DROP_KEYS)
-]
-print(f"[PATCH-A/A+] FEATURES drop: {_before} -> {len(FEATURES)} (removed 'trifecta_support_rate','tsr_prob','*popularity*','*odds*')")
-
-# タイトル: CAND閾値列の一時除外（検証）
-# 説明: exclude_margin_* をいったん外して AUC/ROI 影響を切り分け
-_sus = [c for c in FEATURES if c.startswith("exclude_margin_")]
-if _sus:
-    FEATURES = [c for c in FEATURES if c not in _sus]
-    print(f"[PATCH-C] drop suspects from FEATURES: {_sus}")
-
 
 
 # ------------------------
-# Cell-5: LightGBM 学習（単勝的中率＝binary, 各種改善を反映）
-#   ② Lambdarank並走（切替フラグなしで併走学習）
-#   ④ 配当重み（勝者のみ上乗せ・学習時のみ）
-#   ⑤ モノトニック制約（主要確率系の単調性を担保）
-#   ⑥ 時系列重み（最近データを重視）
-#   ⑦ 小規模アンサンブル（N本の平均；既定3）
+# Cell-5: LightGBM 学習（単勝的中率＝binary, Optuna反映版）
 # ------------------------
-print("\n--- Cell-5: LightGBM学習（単勝的中率＝binary / 改善一式） ---")
-
-import os, numpy as np, pandas as pd, lightgbm as lgb
-from copy import deepcopy
-from pathlib import Path
-
-
-# ==============================================================================
-# === アイデア1-A：Soft-Finish × SP の相互作用特徴量（Cell-5 冒頭） ===
-#   挿入位置：Cell-5の最初（print直後など）、FEATURES抽出の前
-# ==============================================================================
-print("\n[INFO] 相互作用特徴量(SF × zSP) を作成します...")
-_sf_interact = []
-
-for _df in (train, valid, test):
-    if "feat_soft_finish" in _df.columns and "z_pred_time_index_sp" in _df.columns:
-        _df["interact_SF_x_SPz"] = (
-            _df["feat_soft_finish"].fillna(0.0).astype("float32")
-            * _df["z_pred_time_index_sp"].fillna(0.0).astype("float32")
-        ).astype("float32")
-        _sf_interact.append("interact_SF_x_SPz")
-
-print(f"   - 新規作成: {sorted(set(_sf_interact))}")
-
-# FEATURES は Cell-4 で確定済みなので、必要なら念のため追加
-if "FEATURES" in globals():
-    for _n in sorted(set(_sf_interact)):
-        if _n not in FEATURES:
-            FEATURES.append(_n)
-            print(f"   - '{_n}' を FEATURES に追加しました。")
-# ==============================================================================
-
-
+print("\n--- Cell-5: LightGBM学習（単勝的中率＝binary / Optuna最適化パラメータ反映） ---")
 
 # 万一 'feat_soft_finish' が FEATURES に未追加なら注入（存在チェック付き）
 if "feat_soft_finish" in train.columns and "feat_soft_finish" not in FEATURES:
     FEATURES.append("feat_soft_finish")
 
-# ---------- Helper ----------
-def _ensure_category(df, cols):
-    for c in cols:
-        if c in df.columns and df[c].dtype.name != "category":
-            df[c] = df[c].astype("category")
-
-def _monotone_constraints_for(features):
-    """
-    主要“勝率↑で良い”系は +1、明確に逆相関のものは -1、それ以外は 0。
-    ※ カテゴリ列にも要素数合わせで 0 を付与（LGBM側で無視される）
-    """
-    pos_keys = {
-        "pred_prob_stage_a", "pred_ev_stage_b_any", "feat_soft_finish",
-        "tsr_prob", "keep_prob_in3", "pred_time_index_sp"
-    }
-    neg_keys = {"pred_odds"}  # あれば明確に逆単調（オッズ高い=勝率低い）
-    cons = []
-    for f in features:
-        if f in pos_keys:
-            cons.append(1)
-        elif f in neg_keys:
-            cons.append(-1)
-        else:
-            cons.append(0)
-    return cons
-
-def _compute_recency_weight(df, alpha=0.40):
-    """
-    alpha in [0,1]: 0→全期間=1, 1→最古~最新で線形に 0→1 へ
-    実際は (1 - alpha) + alpha * norm で最古~最新が [1-alpha, 1] に。
-    """
-    d = pd.to_datetime(df["date"]).view("int64")
-    if d.max() == d.min():
-        return np.ones(len(df), dtype="float32")
-    norm = (d - d.min()) / (d.max() - d.min())
-    return ((1.0 - alpha) + alpha * norm).astype("float32")
-
-def _compute_payout_weight(df, y, bet_unit=100, alpha=0.08, cap_mult=25.0):
-    """
-    勝者のみ上乗せ: 1 + alpha * (min(unit_return, cap) - 1)
-    loserは1.0。学習時のみ使用（validは1.0で固定）。
-    """
-    win = pd.to_numeric(df.get("win_payout", 0), errors="coerce").fillna(0.0).values
-    unit_return = (win / float(bet_unit)).clip(0, cap_mult)
-    w = np.ones(len(df), dtype="float32")
-    w[y.astype(bool)] = 1.0 + alpha * (unit_return[y.astype(bool)] - 1.0)
-    return w.astype("float32")
-
-def _group_order_and_sizes(df, keys=("date","race_code")):
-    """
-    Lambdarank用に、同一レースを連続させる並びに整列し、
-    連続区間サイズ配列（group）を返す。
-    """
-    gkey = df[list(keys)].apply(tuple, axis=1).to_numpy()
-    # 連続化のため、キーで安定ソート
-    order = np.argsort(gkey, kind="mergesort")
-    g_sorted = gkey[order]
-    # 連続区間サイズ
-    sizes = []
-    cnt = 1
-    for i in range(1, len(g_sorted)):
-        if g_sorted[i] != g_sorted[i-1]:
-            sizes.append(cnt)
-            cnt = 1
-        else:
-            cnt += 1
-    if len(g_sorted) > 0:
-        sizes.append(cnt)
-    return order, np.array(sizes, dtype=np.int32)
-
-class EnsembleLGBM:
-    """小規模アンサンブル（単純平均）"""
-    def __init__(self, boosters):
-        self.boosters = boosters
-        # 代表の best_iteration（中央値）を持たせるだけ（predictでは未使用でもOK）
-        its = [int(b.best_iteration or b.current_iteration()) for b in boosters]
-        self.best_iteration = int(np.median(its)) if len(its) else None
-
-    def predict(self, X, num_iteration=None, raw_score=False):
-        preds = []
-        for b in self.boosters:
-            preds.append(b.predict(X, num_iteration=num_iteration, raw_score=raw_score))
-        return np.mean(np.vstack(preds), axis=0)
-
-# ---------- データ準備 ----------
+# 学習/検証データの抽出
 X_tr = train[FEATURES].copy(); y_tr = train["y_win"].astype("int8").values
 X_va = valid[FEATURES].copy(); y_va = valid["y_win"].astype("int8").values
 
-# カテゴリ列（存在確認しつつ category 型を担保）
+# カテゴリ列: 存在確認しつつ category 型を担保
 cat_cols_exist = [c for c in (cat_cols_final if 'cat_cols_final' in globals() else []) if c in X_tr.columns]
-_ensure_category(X_tr, cat_cols_exist)
-_ensure_category(X_va, cat_cols_exist)
+for c in cat_cols_exist:
+    for _df in (X_tr, X_va):
+        if _df[c].dtype.name != "category":
+            _df[c] = _df[c].astype("category")
 
-pos_rate = float(y_tr.mean()); print(f"   - pos_rate={pos_rate:.4f} ({pos_rate*100:.2f}%)")
+pos_rate = float(y_tr.mean())
+print(f"   - pos_rate={pos_rate:.4f} ({pos_rate*100:.2f}%)")
 
-# ---------- 重み（配当 & 時系列；学習時のみ） ----------
-SEED = int(globals().get("SEED", 42))
-BET_UNIT = int(globals().get("BET_UNIT", 100))
-PAYOUT_ALPHA   = float(os.environ.get("PAYOUT_ALPHA", "0.08"))   # 推奨 0.05〜0.10
-PAYOUT_CAPMULT = float(os.environ.get("PAYOUT_CAPMULT", "25.0")) # 単位払戻の上限（例: 25倍=2,500円/100円）
-RECENCY_ALPHA  = float(os.environ.get("RECENCY_ALPHA", "0.40"))  # 0.2〜0.6 目安
-
-w_payout  = _compute_payout_weight(train, y_tr, bet_unit=BET_UNIT, alpha=PAYOUT_ALPHA, cap_mult=PAYOUT_CAPMULT)
-w_recency = _compute_recency_weight(train, alpha=RECENCY_ALPHA)
-
-# ▼ ここを追加：Cell-4.7 で作った“低配当ゲート”を掛け合わせる
-if "__sample_weight_stage_c__" in train.columns:
-    w_gate = pd.to_numeric(train["__sample_weight_stage_c__"], errors="coerce").fillna(1.0).astype("float32").values
-else:
-    # 念のためのフォールバック（列が無ければゲート=1）
-    w_gate = np.ones(len(train), dtype="float32")
-
-# 3つの重みを合成
-train_weight = (w_payout * w_recency * w_gate).astype("float32")
-
-# （任意）平均1に正規化して学習率の実効スケールを安定化
-if os.environ.get("RENORM_WEIGHTS", "1") == "1":
-    m = float(train_weight.mean())
-    if m > 0:
-        train_weight = (train_weight / m).astype("float32")
-
-# 検証は等重み（評価の解釈を保つ）
-valid_weight = np.ones(len(X_va), dtype="float32")
-
-print(f"   - payout_alpha={PAYOUT_ALPHA}, cap_mult={PAYOUT_CAPMULT}, recency_alpha={RECENCY_ALPHA}")
-print(f"   - weight stats (payout): mean={w_payout.mean():.3f} p90={np.percentile(w_payout,90):.3f} max={w_payout.max():.3f}")
-print(f"   - weight stats (recency): mean={w_recency.mean():.3f} p90={np.percentile(w_recency,90):.3f} max={w_recency.max():.3f}")
-print(f"   - weight stats (gate): mean={w_gate.mean():.3f} p90={np.percentile(w_gate,90):.3f} max={w_gate.max():.1f}")
-print(f"   - weight stats (final): mean={train_weight.mean():.3f} p90={np.percentile(train_weight,90):.3f} max={train_weight.max():.3f}")
-
-# ---------- パラメータ共通部 ----------
+# ====== ベース設定（安全系・共通フラグ） ======
 base_params = {
+    "objective": "binary",
+    "metric": "binary_logloss",
     "boosting_type": "gbdt",
     "seed": SEED,
     "first_metric_only": True,
@@ -1317,10 +951,11 @@ base_params = {
     "verbosity": -1,
     "num_threads": -1,
     "max_bin": 255,
-    # "deterministic": True,  # 必要に応じて
+    # （必要なら）決定論を強めたい時は下を有効化
+    # "deterministic": True,
 }
 
-# Optuna最適化済み（ユーザ提供）
+# ====== Optunaで得た最適化パラメータ（そのまま固定） ======
 optuna_best = {
     "learning_rate": 0.05918612051715358,
     "num_leaves": 42,
@@ -1334,231 +969,74 @@ optuna_best = {
     "feature_fraction_bynode": 0.6790387697880631,
 }
 
-# モノトニック制約
-mono = _monotone_constraints_for(FEATURES)
-
-# （分類）最終パラメータ
-bin_params_base = {
-    **base_params,
-    **optuna_best,
-    "objective": "binary",
-    "metric": "binary_logloss",
-    "monotone_constraints": mono,
+# 再現性用シード（bagging/feature_fraction系にも適用）
+seed_ext = {
+    "feature_fraction_seed": SEED,
+    "bagging_seed": SEED,
+    "data_random_seed": SEED,
 }
 
-# タイトル: 整列＆陽性率ガード
-# 説明: X_tr, y_tr, train_weight の行順一致／Validのpos_rateを明示
-assert np.array_equal(X_tr.index.values, train.index.values), \
-    "[ERR] X_tr と train のindex不一致（整列処理を見直してください）"
-assert len(X_tr) == len(y_tr) == len(train_weight), \
-    "[ERR] 学習配列の長さ不一致（features/labels/weights）"
+lgb_params = {**base_params, **optuna_best, **seed_ext}
 
-print(f"[SANITY] Valid pos_rate = {y_va.mean():.4f} (n={len(y_va)})")
+# LightGBM Dataset 構築
+lgb_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_cols_exist, free_raw_data=False)
+lgb_va = lgb.Dataset(X_va, label=y_va, categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
 
-
-# Dataset（学習は重み付き／検証は等重み）
-lgb_tr = lgb.Dataset(X_tr, label=y_tr, weight=train_weight,
-                     categorical_feature=cat_cols_exist, free_raw_data=False, feature_name=FEATURES)
-lgb_va = lgb.Dataset(X_va, label=y_va, #weight=valid_weight,
-                     categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False, feature_name=FEATURES)
-
+# コールバック
 callbacks = [
-    lgb.early_stopping(stopping_rounds=100, verbose=True),
+    lgb.early_stopping(stopping_rounds=200, verbose=True),
     lgb.log_evaluation(period=100)
 ]
 
-print("[INFO] 使用パラメータ（要約｜binary）:")
-_show = {k: bin_params_base[k] for k in [
+print("[INFO] 使用パラメータ（要約）:")
+_show = {k: lgb_params[k] for k in [
     "learning_rate","num_leaves","min_data_in_leaf","feature_fraction","feature_fraction_bynode",
     "bagging_fraction","bagging_freq","lambda_l1","lambda_l2","min_gain_to_split"
-] if k in bin_params_base}
+] if k in lgb_params}
 print(_show)
-print(f"[INFO] モノトニック制約（先頭20件預り表示）: {mono[:20]} ... len={len(mono)}")
 
-# ---------- ⑦ 小規模アンサンブル（N本） ----------
-ENSEMBLE_N = int(os.environ.get("STAGEC_ENSEMBLE_N", "2"))
-ENSEMBLE_N = max(1, min(ENSEMBLE_N, 5))
-
-bin_boosters = []
-best_iters = []
-for i in range(ENSEMBLE_N):
-    seed_i = SEED + 11*i + 7  # 簡易にずらす
-    params_i = deepcopy(bin_params_base)
-    params_i.update({
-        "seed": seed_i,
-        "feature_fraction_seed": seed_i,
-        "bagging_seed": seed_i,
-        "data_random_seed": seed_i,
-    })
-    print(f"\n[Ensemble] Training binary model #{i+1}/{ENSEMBLE_N} (seed={seed_i})")
-    booster = lgb.train(
-        params=params_i,
-        train_set=lgb_tr,
-        valid_sets=[lgb_va, lgb_tr],
-        valid_names=["valid","train"],
-        num_boost_round=2000,
-        callbacks=callbacks,
-    )
-    bin_boosters.append(booster)
-    best_iters.append(int(booster.best_iteration or booster.current_iteration()))
-
-print("[GUARD] early_stopping monitor = VALID (valid_sets[0])")
-print(f"\n[INFO] Ensemble binary complete: best_iter (median/mean) = {np.median(best_iters):.0f} / {np.mean(best_iters):.1f}")
-model = EnsembleLGBM(bin_boosters)  # ← 以降の Cell-X はこの model.predict(...) を使い平均予測
-
-# 代表モデルの保存（#1 を保存／全体は任意で複数保存）
-STAGE_C_MODEL_PATH = globals().get("STAGE_C_MODEL_PATH",
-                                   os.path.join(ART_DIR_C, "JRA_stage_c_model.txt"))
-Path(os.path.dirname(STAGE_C_MODEL_PATH)).mkdir(parents=True, exist_ok=True)
-bin_boosters[0].save_model(STAGE_C_MODEL_PATH)
-print(f"   ✅ モデル保存（代表#1）: {STAGE_C_MODEL_PATH}")
-
-# 追加保存（任意）：他メンバーをサフィックス付きで保存
-try:
-    for i, bst in enumerate(bin_boosters[1:], start=2):
-        p = STAGE_C_MODEL_PATH.replace(".txt", f"_m{i}.txt").replace(".pkl", f"_m{i}.txt")
-        bst.save_model(p)
-    print(f"   - 追加メンバーも保存（_m2..）")
-except Exception as e:
-    print(f"   [WARN] 追加メンバー保存に失敗: {e}")
-
-# ---------- ② Lambdarank 並走（切替フラグなし） ----------
-# 学習・検証をレース単位で連続化した順序に並べ直し、group を渡す
-print("\n[Rank] Lambdarank 併走学習を開始します（ndcg@1,3,5）")
-order_tr, group_tr = _group_order_and_sizes(train)
-order_va, group_va = _group_order_and_sizes(valid)
-
-X_tr_r = X_tr.iloc[order_tr]
-y_tr_r = y_tr[order_tr]
-X_va_r = X_va.iloc[order_va]
-y_va_r = y_va[order_va]
-
-lgb_tr_rank = lgb.Dataset(
-    X_tr_r, label=y_tr_r, group=group_tr,
-    categorical_feature=cat_cols_exist, free_raw_data=False, feature_name=FEATURES
-)
-lgb_va_rank = lgb.Dataset(
-    X_va_r, label=y_va_r, group=group_va,
-    categorical_feature=cat_cols_exist, reference=lgb_tr_rank, free_raw_data=False, feature_name=FEATURES
+# 学習（ESで自動的にbest_iterationを決定）
+model = lgb.train(
+    params=lgb_params,
+    train_set=lgb_tr,
+    valid_sets=[lgb_tr, lgb_va],
+    valid_names=["train","valid"],
+    num_boost_round=5000,
+    callbacks=callbacks,
 )
 
-rank_params = {
-    **base_params,
-    **optuna_best,
-    "objective": "lambdarank",
-    "metric": "ndcg",
-    "eval_at": [1,3,5],
-    "seed": SEED + 777,
-    "feature_fraction_seed": SEED + 777,
-    "bagging_seed": SEED + 777,
-    "data_random_seed": SEED + 777,
-    # モノトニック制約は ranking でも有効（不要なら外してOK）
-    "monotone_constraints": mono,
-}
+best_iter = model.best_iteration or model.current_iteration()
+print(f"   - best_iter = {best_iter}  （Optuna再検証の目安 ≈ 80）")
 
-callbacks_rank = [
-    lgb.early_stopping(stopping_rounds=100, verbose=True),
-    lgb.log_evaluation(period=100),
-]
 
-print("[INFO] 使用パラメータ（要約｜lambdarank）:")
-_show_r = {k: rank_params[k] for k in [
-    "learning_rate","num_leaves","min_data_in_leaf","feature_fraction","feature_fraction_bynode",
-    "bagging_fraction","bagging_freq","lambda_l1","lambda_l2","min_gain_to_split"
-] if k in rank_params}
-print(_show_r)
-
-rank_model = lgb.train(
-    params=rank_params,
-    train_set=lgb_tr_rank,
-    valid_sets=[lgb_tr_rank, lgb_va_rank],
-    valid_names=["train_rank","valid_rank"],
-    num_boost_round=2000,
-    callbacks=callbacks_rank,
-)
-rank_best_iter = int(rank_model.best_iteration or rank_model.current_iteration())
-print(f"   - rank_best_iter = {rank_best_iter}")
-
-# 参考: 検証における簡易 Top1 指標（lambdarank単体の相性確認）
-try:
-    # そのまま logit 相当（raw_score=True）でレース内Top1の正解率
-    from collections import defaultdict
-    valid_rank_score = pd.Series(rank_model.predict(X_va, num_iteration=rank_best_iter, raw_score=True))
-    key_va = valid[["date","race_code"]].apply(tuple, axis=1).to_numpy()
-    df_tmp = pd.DataFrame({"k": key_va, "y": y_va, "s": valid_rank_score.values})
-    top1 = df_tmp.sort_values("s", ascending=False).groupby("k", sort=False).head(1)
-    top1_acc = float(top1["y"].mean()) if len(top1) else float("nan")
-    print(f"   [Rank] Valid Top1 accuracy (参考): {top1_acc*100:.2f}%")
-except Exception as e:
-    print(f"   [WARN] Rankの参考評価で例外: {e}")
-
-# 代表 booster の best_iteration（中央値）を表示（Cell-Xのログ整合）
-best_iter = getattr(model, "best_iteration", None)
-print(f"\n   - best_iter (ensemble median) = {best_iter}  （参考：個別={best_iters[:min(5,len(best_iters))]}）")
-
-# グローバルへ露出（Cell-X が拾えるように）
-globals()["model"] = model               # ← 以降の Cell-X はこれを使って予測（平均）
-globals()["rank_model"] = rank_model     # ← 併走モデル（分析・将来の活用用）
-
-# 代表(#1)と追加メンバーは上で保存済み
-print("   ✅ モデル保存: 代表(#1)＋メンバー（_m2..）を保存済み")
-# 互換用パス（代表#1）: STAGE_C_MODEL_PATH をそのまま stage-today が使えます
-
-# --- Compat: 後段セルが探す単一Boosterをエクスポート（Ensemble対応版） ---
+# --- Compat: 後段セルが探す単一Boosterをエクスポート ---
 try:
     booster_alias = None
-
-    # 1) すでに Booster 単体ならそのまま
     if isinstance(model, lgb.Booster):
         booster_alias = model
-
-    # 2) EnsembleLGBM（今回の実装）：.boosters の先頭を採用
-    if booster_alias is None and hasattr(model, "boosters"):
-        bs = getattr(model, "boosters", None)
-        if isinstance(bs, (list, tuple)) and len(bs) > 0 and isinstance(bs[0], lgb.Booster):
-            booster_alias = bs[0]
-
-    # 3) 念のため学習時の変数も見る
-    if booster_alias is None and "bin_boosters" in globals():
-        bs = globals()["bin_boosters"]
-        if isinstance(bs, (list, tuple)) and len(bs) > 0 and isinstance(bs[0], lgb.Booster):
-            booster_alias = bs[0]
-
-    # 4) 旧実装の互換
-    if booster_alias is None and hasattr(model, "members"):
-        ms = getattr(model, "members", None)
-        if isinstance(ms, (list, tuple)) and len(ms) > 0 and isinstance(ms[0], lgb.Booster):
-            booster_alias = ms[0]
-    if booster_alias is None and hasattr(model, "models"):
-        ms = getattr(model, "models", None)
-        if isinstance(ms, (list, tuple)) and len(ms) > 0 and isinstance(ms[0], lgb.Booster):
-            booster_alias = ms[0]
+    elif hasattr(model, "members") and len(model.members) > 0:
+        booster_alias = model.members[0]                 # 代表(#1)
+    elif hasattr(model, "models") and len(model.models) > 0:
+        booster_alias = model.models[0]
 
     if booster_alias is not None:
-        # 後段セルが探す名前を“全部”用意しておく
-        gbm = booster_alias
-        gbm_final = booster_alias
-        bst = booster_alias
-
-        # best_iter（代表値）も置いておく
+        gbm = booster_alias          # 後段セルが探す候補その1
+        gbm_final = booster_alias    # 候補その2
+        # best_iter もだいたい合う値を置いておく（使われる場合に備え）
         try:
             _its = []
             if isinstance(model, lgb.Booster):
                 _its = [getattr(model, "best_iteration", 0) or 0]
-            elif hasattr(model, "boosters"):
-                _its = [getattr(m, "best_iteration", 0) or 0 for m in model.boosters]
             elif hasattr(model, "members"):
                 _its = [getattr(m, "best_iteration", 0) or 0 for m in model.members]
             elif hasattr(model, "models"):
                 _its = [getattr(m, "best_iteration", 0) or 0 for m in model.models]
-            best_iter = int(np.median([i for i in _its if i])) if _its else best_iter
+            best_iter = int(np.median([i for i in _its if i])) if _its else None
         except Exception:
             pass
-
-        print("[Compat] Exported Booster alias as 'gbm' / 'gbm_final' / 'bst'（best_iter≈%s）" % str(best_iter))
+        print("[Compat] Exported Booster alias as 'gbm' / 'gbm_final'（best_iter≈%s）" % str(best_iter))
     else:
         print("[Compat] Booster alias not exported（unknown model container）")
-
 except Exception as e:
     print(f"[Compat][WARN] Booster aliasing failed: {e}")
 
@@ -1571,52 +1049,13 @@ print("\n" + "="*50)
 print("◎ OOF予測・softmax較正・温度スケーリング（Stage-C 単勝）")
 print("="*50)
 
-import os, json, gc
+import os, json
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
 from sklearn.model_selection import KFold, TimeSeriesSplit
 from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
 from scipy.optimize import minimize
-
-
-# タイトル: 動的T(g)の縮退を防止（弱いL2＋Tレンジ微修正）
-# 説明: Tが全レース0.90に張り付く縮退を、L2正則化＋Tの上下限を狭めて回避します。
-#       既存関数には触らず、このセル内だけで完結（最小変更）。
-# ▼ 既存の T_MIN/T_MAX があっても上書きしません（別名で運用）
-# タイトル: 動的T(g)の弱正則化＆レンジ微調整
-# 説明: 過信も過度平滑も避けるため、T_min=0.90, T_max=1.20 に。
-PATCH_T_MIN = 0.90    # 以前の 0.95 より下げ、HHI高のレースで少しだけ鋭くできる余地を残す
-PATCH_T_MAX = 1.20
-PATCH_L2    = 5e-4    # ごく弱く
-
-def _learn_dynamic_T_from_oof_patch(raw_logit_oof, y_train_bool, df_train):
-    import numpy as np
-    from scipy.optimize import minimize
-    gid, hhi_g, logn_g = _group_metrics_for_T(df_train)
-
-    def _T_from(theta):
-        a0,a1,a2 = theta
-        Tg = np.exp(a0 + a1*hhi_g + a2*logn_g)
-        # HHIが高い（本命集中）時はわずかに下振れを許容（最大0.05だけ下）
-        floor = PATCH_T_MIN - 0.05*(hhi_g > np.quantile(hhi_g, 0.8))
-        return np.clip(Tg, floor, PATCH_T_MAX)
-
-    def _nll(theta):
-        Tg = _T_from(theta)
-        p  = _softmax_by_group_dynamicT(raw_logit_oof, gid, Tg)
-        eps=1e-15
-        return -(np.log(np.clip(p[y_train_bool], eps, 1.0)).mean()) + PATCH_L2*np.sum(theta*theta)
-
-    theta0 = np.array([0.0, -0.3, 0.2])
-    res = minimize(_nll, x0=theta0, method="L-BFGS-B")
-    theta = res.x
-    Tg = _T_from(theta)
-    print(f"[PATCH-B] dynamic T(g): min={Tg.min():.3f} p10={np.percentile(Tg,10):.3f} "
-          f"med={np.median(Tg):.3f} p90={np.percentile(Tg,90):.3f} max={Tg.max():.3f}")
-    return theta  # (a0,a1,a2)
-
-
 
 # ---- 既存オブジェクトを取得（環境差を吸収） -----------------------
 def _get_feature_cols():
@@ -1655,181 +1094,45 @@ def _softmax_by_group(raw_logit, gid, T=1.0):
     # gid: 0..G-1 の整数グループID
     eps = 1e-15
     z = raw_logit / max(T, eps)
+    # group 内で max を引いて exp
+    # ここで group-wise に安定化
+    zmax = np.zeros_like(z)
+    # zmax[g] = max(z in group g)
+    # ベクトルでやるために、各groupの最大を先に求めてブロードキャスト
+    n = len(z)
     gmax = np.full(gid.max()+1, -np.inf, dtype=np.float64)
-    np.maximum.at(gmax, gid, z)
+    np.maximum.at(gmax, gid, z)                 # gmax[g] = max(z[gid==g])
     zmax = gmax[gid]
     ex = np.exp(z - zmax)
     gsum = np.zeros_like(gmax)
-    np.add.at(gsum, gid, ex)
-    p = ex / np.clip(gsum[gid], eps, None)
+    np.add.at(gsum, gid, ex)                    # gsum[g] = sum(exp(z[gid==g]))
+    denom = gsum[gid]
+    p = ex / np.clip(denom, eps, None)
+    # 数値安全にクリップ
     return np.clip(p, eps, 1 - eps).astype('float64')
 
-# ========= ここから「動的温度 T(g)」の追加 =========
-# TSRをレース内で確率スケール（合計=1）に正規化
-def _tsr_prob_norm(df, tsr_col="trifecta_support_rate"):
-    # レースキーを 0..G-1 の整数IDへ
-    keys = df[["date","race_code"]].apply(tuple, axis=1).values
-    _, gid = np.unique(keys, return_inverse=True)  # contiguous group ids
-
-    # TSRをfloatに
-    s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).astype("float64").values
-
-    # group-wise の合計を np.add.at で作る
-    G = int(gid.max()) + 1
-    denom = np.zeros(G, dtype=np.float64)
-    np.add.at(denom, gid, s)
-
-    # 各行の分母を引き当てて正規化（合計=1）
-    denom_safe = np.clip(denom[gid], 1e-12, None)
-    return (s / denom_safe), gid  # tsr_prob, gid
-
-
-def _group_metrics_for_T(df):
-    # レース単位の HHI と log(頭数) を作る
-    tsr_p, gid = _tsr_prob_norm(df)
-    G = int(gid.max()) + 1
-
-    p2_sum = np.zeros(G, dtype=np.float64)
-    cnt    = np.zeros(G, dtype=np.int32)
-    np.add.at(p2_sum, gid, tsr_p * tsr_p)  # HHI = Σ p_i^2
-    np.add.at(cnt,    gid, 1)
-
-    hhi_g  = p2_sum
-    logn_g = np.log(np.maximum(cnt, 1))
-    return gid, hhi_g, logn_g
-
-# パラメトリックT: T(g) = T_min + (T_max-T_min) * sigmoid(a0 + a1*HHI + a2*logN)
-T_MIN, T_MAX = 0.90, 1.45  # 安定レンジ（必要に応じて調整可）
-
-def _T_from_params(params, hhi_g, logn_g, tmin=T_MIN, tmax=T_MAX):
-    a0, a1, a2 = params
-    s = 1.0 / (1.0 + np.exp(-(a0 + a1*hhi_g + a2*logn_g)))
-    return tmin + (tmax - tmin) * s  # shape: (G,)
-
-def _softmax_by_group_dynamicT(raw_logit, gid, T_group):
-    """グループごと温度が異なるsoftmax"""
-    eps = 1e-15
-    z = raw_logit / np.clip(T_group[gid], eps, None)
-
-    G = int(gid.max()) + 1
-    gmax = np.full(G, -np.inf, dtype=np.float64)
-    np.maximum.at(gmax, gid, z)
-    zmax = gmax[gid]
-
-    ex = np.exp(z - zmax)
-    gsum = np.zeros(G, dtype=np.float64)
-    np.add.at(gsum, gid, ex)
-
-    p = ex / np.clip(gsum[gid], eps, None)
-    return np.clip(p, eps, 1 - eps).astype("float64")
-
-# タイトル: 動的T(g)学習（重み付きNLL対応・完全差し替え版）
-# 説明:
-#   OOFの logit と同一のサンプル重みで NLL を最小化し、較正の分布ズレを解消します。
-#   既存の振る舞いは weight=None のときと等価（後方互換）。
-#   L2正則化はデフォルトOFF（必要時のみ l2>0 を指定）。
-def _learn_dynamic_T_from_oof(raw_logit_oof, y, df_tr, weight=None, l2=0.0, normalize_weight=True):
-    """
-    Args:
-        raw_logit_oof : np.ndarray, shape (N,)
-            OOF上の raw logit（レース内softmax前のスコア。Nは学習サンプル数）
-        y : array-like, shape (N,)
-            目的変数（1=勝ち馬, 0=その他）。内部では bool に変換します
-        df_tr : pandas.DataFrame, shape (N, *)
-            学習サンプル行に対応する行。race単位のID/統計を作るために使います
-        weight : array-like or None, shape (N,), optional
-            サンプル重み（Cell-4.7で作成した "__sample_weight_stage_c__" 等）
-            None の場合は従来どおり等重み
-        l2 : float, optional
-            θ=(a0,a1,a2) に対する L2 正則化係数。デフォルト 0.0
-        normalize_weight : bool, optional
-            重みの平均を1に正規化してスケールを揃える（最適化の安定化用）
-
-    Returns:
-        np.ndarray(dtype=float, shape=(3,)) : 学習した (a0, a1, a2)
-    """
-    import numpy as np
-    from scipy.optimize import minimize
-
-    # --- 前処理（型/NaN クリーニング）---
-    raw_logit_oof = np.asarray(raw_logit_oof, dtype=np.float64)
-    y = np.asarray(y).astype(bool)
-    if raw_logit_oof.shape[0] != y.shape[0] or raw_logit_oof.shape[0] != len(df_tr):
-        raise ValueError("[FATAL] _learn_dynamic_T_from_oof: 長さが一致しません。raw_logit_oof, y, df_tr を確認してください。")
-
-    m = np.isfinite(raw_logit_oof)
-    if weight is not None:
-        w = np.asarray(weight, dtype=np.float64)
-        if w.shape[0] != raw_logit_oof.shape[0]:
-            raise ValueError("[FATAL] weight の長さが合いません。")
-        m &= np.isfinite(w)
-    else:
-        w = None
-
-    # 有効サンプルへ圧縮（マスク順序を厳密に保持）
-    z   = raw_logit_oof[m]
-    yy  = y[m]
-    dfm = df_tr.loc[m].copy()
-    if w is not None:
-        ww = w[m]
-        if normalize_weight:
-            ww = ww / (ww.mean() + 1e-12)  # 平均1にスケール
-    else:
-        ww = None
-
-    # レース単位のグループ情報を構築（既存のヘルパーを利用）
-    gid, hhi_g, logn_g = _group_metrics_for_T(dfm)
-
-    # --- 目的関数（重み付きNLL + L2）---
-    #  p は「各行の“正解クラス（勝ち馬=1）”の確率」に対応するベクトルを想定
-    def _nll(theta):
-        T_group = _T_from_params(theta, hhi_g, logn_g)
-        p = _softmax_by_group_dynamicT(z, gid, T_group)  # shape=(len(z),)
-        # 勝ち馬行だけを抽出（勝者のlog pの合計を最大化 ≒ NLL最小化）
-        pw = p[yy]
+# ---- multiclass（レース内）NLLで温度を学習 -------------------------
+def _learn_temperature_softmax(raw_logit, y, gid):
+    # レース毎に1頭だけ y=1 であることを仮定（単勝）
+    # 目的: -mean(log P_winner)，P = softmax(logit/T)
+    def nll(theta):
+        T = float(theta[0])
+        if T <= 0.0: return 1e9
+        p = _softmax_by_group(raw_logit, gid, T=T)
+        # 勝ち馬行のみ抽出（multiclass NLL相当）
+        pw = p[y.astype(bool)]
         if pw.size == 0:
-            return 1e9  # まれな異常系
-        eps = 1e-15
-        log_pw = np.log(np.clip(pw, eps, 1.0))
-        if ww is None:
-            loss = -np.mean(log_pw)
-        else:
-            # 重みは勝者行に対応するものだけを抽出
-            ww_pos = ww[yy]
-            loss = -np.average(log_pw, weights=ww_pos)
-        if l2 > 0.0:
-            loss += float(l2) * float(np.dot(theta, theta))
-        return loss
-
-    # --- 最適化 ---
-    # 初期値の意味：市場集中（HHI↑）でシャープ（a1<0）、頭数多いとソフト（a2>0）
-    theta0 = np.array([0.0, -2.0, 0.8], dtype=np.float64)
-    res = minimize(_nll, x0=theta0, method="L-BFGS-B")
-
-    # ログ出力（デバッグ用）
-    try:
-        a0, a1, a2 = [float(v) for v in res.x]
-        print(f"[INFO] Learn Dynamic T(g) (weighted={ww is not None}) "
-              f"a0={a0:.4f}, a1={a1:.4f}, a2={a2:.4f}, nll={float(res.fun):.6f}, "
-              f"iters={getattr(res, 'nit', None)}")
-    except Exception:
-        pass
-
-    return np.asarray(res.x, dtype=float)  # (a0, a1, a2)
-
-
-def _probs_from_logit_dynamicT(df, raw_logit, params):
-    gid, hhi_g, logn_g = _group_metrics_for_T(df)
-    T_group = _T_from_params(params, hhi_g, logn_g)
-    return _softmax_by_group_dynamicT(raw_logit.astype("float64"), gid, T_group)
-# ========= 「動的温度 T(g)」追加ここまで =========
-
-# タイトル: OOF（raw_logit）作成ブロック（インデント修正済み）
-# 説明: OOF用のLightGBMを本学習条件に揃え、重みは位置参照で安全に抽出する
+            return 1e9
+        return -np.mean(np.log(pw))
+    res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)], method='L-BFGS-B')
+    return float(res.x[0]), float(res.fun)
 
 # ---- OOF（raw_logit）作成 ------------------------------------------
+from sklearn.model_selection import KFold, TimeSeriesSplit
+import numpy as np, gc, lightgbm as lgb
+
 N_SPLITS = int(os.environ.get("STAGEC_OOF_K", 5))
-USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルトを TimeSeriesSplit（リーク対策）
+USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルトを TimeSeriesSplit に変更（リーク対策）
 print(f"[INFO] OOFを作成します: n_splits={N_SPLITS} / splitter={'TimeSeriesSplit' if USE_TSS else 'KFold'}")
 splitter = TimeSeriesSplit(n_splits=N_SPLITS) if USE_TSS else KFold(n_splits=N_SPLITS, shuffle=False)
 
@@ -1850,18 +1153,32 @@ def _pick_lgb_params():
         "verbosity": -1,
     }
 
+_lgb_base = _pick_lgb_params()
+
 # 2) 浅いコピー → OOF向けの上書き（分散化パッチ）
-# --- 置換後（最小差分）：本学習の bin_params_base / mono を流用 ---
-params_oof = {**bin_params_base}     # ← Cell-5 で定義済み
+params_oof = _lgb_base.copy()          # ← dict(_lgb_base) でもOK（浅いコピー）
 params_oof.update({
     "objective": "binary",
     "metric": "binary_logloss",
     "first_metric_only": True,
-    "monotone_constraints": mono,    # ← 同じ制約を適用
+
+    # 重要度の“割れ過ぎ”抑制（多様性UP、精度は通常ほぼ維持）
+    "feature_fraction": 0.80,
+    "feature_fraction_bynode": 0.60,   # v3+ 相当で有効
+    "bagging_fraction": 0.80,
+    "bagging_freq": 1,
+    "lambda_l2": 1.0,
+    "min_gain_to_split": 1e-4,
+
+    # 再現性
+    "deterministic": True,
+    "num_threads": -1,
 })
+# seed類がベースに無い場合のフォールバック
 for k in ("feature_fraction_seed", "bagging_seed", "data_random_seed", "seed"):
     params_oof.setdefault(k, 42)
 
+# 3) Dataset 構築にも一貫パラメータを渡す（max_bin/two_round/data_random_seedなど）
 _dataset_params = {k: params_oof[k] for k in [
     "max_bin", "min_data_in_bin", "two_round", "data_random_seed",
     "force_col_wise", "histogram_pool_size", "bin_construct_sample_cnt",
@@ -1875,29 +1192,6 @@ print("[INFO] OOF LightGBM パラメータ（要約）:", {
     if k in params_oof
 })
 
-# --- OOF用の重み取得関数（位置参照固定）をループ前に定義 ---
-def _ensure_oof_train_weight():
-    import numpy as np
-    global train_weight
-
-    n = len(train)
-    # 未定義 or 長さ不一致なら学習時と同条件で再計算
-    if ('train_weight' not in globals()) or (getattr(train_weight, '__len__', lambda: -1)() != n):
-        y_all = train['y_win'].astype('int8').values
-        _w_p  = _compute_payout_weight(train, y_all, bet_unit=BET_UNIT, alpha=PAYOUT_ALPHA, cap_mult=PAYOUT_CAPMULT)
-        _w_r  = _compute_recency_weight(train, alpha=RECENCY_ALPHA)
-        _w_g  = pd.to_numeric(train.get("__sample_weight_stage_c__", 1.0), errors="coerce").fillna(1.0).astype("float32").values
-        w = (_w_p * _w_r * _w_g).astype("float32")
-        if os.environ.get("RENORM_WEIGHTS", "1") == "1":
-            m = float(w.mean())
-            if m > 0:
-                w = (w / m).astype("float32")
-        train_weight = w  # グローバル更新
-
-    # どんな型でも ndarray に落として「位置参照」を保証
-    return np.asarray(train_weight, dtype="float32")
-
-# ---- OOF ループ ----
 for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     print(f"  - Fold {fold}/{N_SPLITS}")
 
@@ -1906,25 +1200,19 @@ for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     X_va = train.iloc[va_idx][FEATURE_COLS]
     y_va = train.iloc[va_idx][TARGET].astype('int8').values
 
-    # 追加（整列ガード。ズレてたら即停止）
-    assert np.array_equal(X_tr.index.values, train.iloc[tr_idx].index.values), \
-        "[ERR] OOF: X_tr と train[tr_idx] のindex不一致"
-    assert np.array_equal(X_va.index.values, train.iloc[va_idx].index.values), \
-        "[ERR] OOF: X_va と train[va_idx] のindex不一致"
-
-    # 重みを位置参照で取得
-    _w_all = _ensure_oof_train_weight()
-    # Title: OOFでも本体と同じサンプル重みを適用
-    # Description: 較正用logitの分布を本体学習と一致させ、T学習のズレを防ぐ
-    # タイトル: OOF用サンプル重み取得の loc→iloc 修正
-    # 説明: TimeSeriesSplit が返す tr_idx/va_idx は位置インデックス。iloc で取得し KeyError を回避
-    _w_tr = train["__sample_weight_stage_c__"].to_numpy()[tr_idx]   # ← 位置参照
-    _w_va = np.ones(len(va_idx), dtype="float32")                   # 監視は等重みでOK（揃えたいなら同列でも可）
-
-    dtr = lgb.Dataset(train.iloc[tr_idx][FEATURES], label=train.iloc[tr_idx]["y_win"], weight=_w_tr)
-    dva = lgb.Dataset(train.iloc[va_idx][FEATURES], label=train.iloc[va_idx]["y_win"], weight=_w_va)
-
-
+    d_tr = lgb.Dataset(
+        X_tr, label=y_tr,
+        categorical_feature=CAT_COLS,
+        params=_dataset_params,
+        free_raw_data=False
+    )
+    d_va = lgb.Dataset(
+        X_va, label=y_va,
+        categorical_feature=CAT_COLS,
+        reference=d_tr,
+        params=_dataset_params,
+        free_raw_data=False
+    )
 
     fold_model = lgb.train(
         params_oof, d_tr,
@@ -1937,33 +1225,17 @@ for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
         ]
     )
 
+    # raw_score=True → ロジット（margin）を取得
     oof_logit[va_idx] = fold_model.predict(
         X_va, num_iteration=fold_model.best_iteration, raw_score=True
     )
     best_iters.append(int(fold_model.best_iteration or 100))
 
+    # メモリ解放
     del d_tr, d_va, X_tr, X_va, y_tr, y_va, fold_model
     gc.collect()
 
 print(f"[INFO] OOF（raw_logit）完了: shape={oof_logit.shape}  / best_iter(median/mean)={np.median(best_iters):.0f}/{np.mean(best_iters):.1f}")
-
-
-# タイトル: 動的T(g)の学習（重み付き）呼び出し
-# タイトル: 動的T(g)の学習（重み付き）
-# 説明: OOFの「有効行」に合わせ、Cell-4.7 で作った学習重みで NLL を最小化
-m_use   = np.isfinite(raw_logit_oof) & train["y_win"].notna()
-w_calib = train.loc[m_use, "__sample_weight_stage_c__"].astype("float32").values  # ← ブールマスクなので loc でOK
-
-theta = _learn_dynamic_T_from_oof(
-    raw_logit_oof[m_use],
-    train.loc[m_use, "y_win"].astype("int8").values,
-    train.loc[m_use, :],     # グループ計算用に同じ行を渡す
-    weight=w_calib,          # ★ここが“1行”の肝
-    l2=1e-4,
-    normalize_weight=True
-)
-a0, a1, a2 = map(float, theta)
-print(f"[INFO] 学習した動的温度パラメータ（weighted）: a0={a0:.4f}, a1={a1:.4f}, a2={a2:.4f}")
 
 
 
@@ -1972,18 +1244,22 @@ model, best_iter = _get_model_and_best_iter()
 valid_logit = model.predict(valid[FEATURE_COLS], num_iteration=best_iter, raw_score=True)
 test_logit  = model.predict(test[FEATURE_COLS],  num_iteration=best_iter, raw_score=True)
 
-# ---- 温度：静的T（従来）を廃止 → 「動的温度 T(g)」を学習・適用 -------
+# ---- 温度Tを multiclass-NLL（レース内 softmax）で学習 ----------------
 gid_tr = _group_ids(train, ("date","race_code"))
+gid_va = _group_ids(valid, ("date","race_code"))
 y_tr   = train[TARGET].astype('int8').values
+y_va   = valid[TARGET].astype('int8').values
 
-#T_params = _learn_dynamic_T_from_oof(oof_logit, y_tr, train)  # (a0,a1,a2)
-# パッチ版で上書き学習（セル内のみ反映）
-T_params = _learn_dynamic_T_from_oof_patch(raw_logit_oof, (y_train>0), train)  # ← 新
+# 学習の安定化のため OOF+Valid を併合
+p_for_T_logit = np.concatenate([oof_logit, valid_logit])
+g_for_T       = np.concatenate([gid_tr, gid_va])
+y_for_T       = np.concatenate([y_tr, y_va])
 
-print(f"[INFO] 学習した動的温度パラメータ: a0={T_params[0]:.4f}, a1={T_params[1]:.4f}, a2={T_params[2]:.4f}  "
-      f"(T_min={T_MIN:.2f}, T_max={T_MAX:.2f})")
+#T_star, nll_star = _learn_temperature_softmax(p_for_T_logit, y_for_T, g_for_T)
+T_star, _ = _learn_temperature_softmax(oof_logit, y_tr, gid_tr)
+print(f"[INFO] 学習した温度: T={T_star:.4f} ") #  (multiclass NLL={nll_star:.5f})")
 
-# ---- softmax（T=1 と 動的T(g)）で確率化 ------------------------------
+# ---- softmax（T=1 と T=T_star）で確率化 ------------------------------
 def _probs_from_logit(df, raw_logit, T):
     gid = _group_ids(df, ("date","race_code"))
     return _softmax_by_group(raw_logit.astype('float64'), gid, T=T)
@@ -1993,10 +1269,10 @@ train_prob_raw = _probs_from_logit(train, oof_logit,     T=1.0)
 valid_prob_raw = _probs_from_logit(valid, valid_logit,  T=1.0)
 test_prob_raw  = _probs_from_logit(test,  test_logit,   T=1.0)
 
-# calibrated（動的T(g)）
-train_prob_cal = _probs_from_logit_dynamicT(train, oof_logit,    T_params)
-valid_prob_cal = _probs_from_logit_dynamicT(valid, valid_logit,  T_params)
-test_prob_cal  = _probs_from_logit_dynamicT(test,  test_logit,   T_params)
+# calibrated（T=T_star）
+train_prob_cal = _probs_from_logit(train, oof_logit,     T=T_star)
+valid_prob_cal = _probs_from_logit(valid, valid_logit,  T=T_star)
+test_prob_cal  = _probs_from_logit(test,  test_logit,   T=T_star)
 
 # ---- レース内合計チェック -------------------------------------------
 def _sum_by_race(df, p):
@@ -2009,15 +1285,13 @@ print(f"[DBG] Train(OOF) 予測合計/レース: p50={q_tr[0]:.3f}, p90={q_tr[1]
 print(f"[DBG] Valid      予測合計/レース: p50={q_va[0]:.3f}, p90={q_va[1]:.3f}, max={q_va[2]:.3f}")
 print(f"[DBG] Test       予測合計/レース: p50={q_te[0]:.3f}, p90={q_te[1]:.3f}, max={q_te[2]:.3f}")
 
-# 参考：学習時のレース別T(g)の概要
-_gid, _hhi, _logn = _group_metrics_for_T(train)
-_Tg = _T_from_params(T_params, _hhi, _logn)
-print(f"[INFO] 動的T(g) 概況: median={np.median(_Tg):.3f}, p10={np.percentile(_Tg,10):.3f}, p90={np.percentile(_Tg,90):.3f}")
-
 # ---- メトリクス（LogLoss/AUC/Brier） --------------------------------
+# * logloss は通常の binary logloss（y∈{0,1}, p=softmax確率）で OK
+# * AUC は馬単位の二値AUC（参考指標）
+# * Brier は二値Brier
 def _metrics(y, p):
     return {
-        "logloss": log_loss(y, p),
+        "logloss": log_loss(y, p),               # ← eps引数は渡さない（TypeError回避）
         "auc":     roc_auc_score(y, p),
         "brier":   brier_score_loss(y, p)
     }
@@ -2044,13 +1318,14 @@ _print_table("\n[INFO] モデル評価（softmax後 / T=1.0）", [
     ("Valid",      m_valid_raw),
     ("Test",       m_test_raw),
 ])
-_print_table("\n[INFO] モデル評価（温度較正後 / 動的T(g)）", [
+_print_table("\n[INFO] モデル評価（温度較正後 / T*=%.4f）" % T_star, [
     ("Train(OOF)", m_train_cal),
     ("Valid",      m_valid_cal),
     ("Test",       m_test_cal),
 ])
 
 # ---- 出力列を統一：pred_win_prob を『較正後 softmax 確率』に確定 ----
+# 既存の pred_win_prob があれば退避
 for df_ in (train, valid, test):
     if 'pred_win_prob' in df_.columns:
         df_['pred_win_prob_raw_backup'] = df_['pred_win_prob'].values
@@ -2059,30 +1334,28 @@ train['pred_win_prob'] = train_prob_cal.astype('float32')
 valid['pred_win_prob'] = valid_prob_cal.astype('float32')
 test['pred_win_prob']  = test_prob_cal.astype('float32')
 
-# ---- 温度をメタ保存（動的パラメータを保存） --------------------------
+# ---- 温度をメタ保存（任意） ----------------------------------------
 try:
     meta_path = globals().get('STAGE_C_META_PATH', os.path.join(ART_DIR_C, "JRA_stage_c_meta.json"))
     if meta_path:
         _meta = {}
         if os.path.exists(meta_path):
             with open(meta_path, 'r') as f: _meta = json.load(f)
-        _meta['temperature_softmax'] = {
-            "mode": "dynamic_sigmoid_linear",
-            "T_min": float(T_MIN),
-            "T_max": float(T_MAX),
-            "params": [float(T_params[0]), float(T_params[1]), float(T_params[2])],
-            "note": "T(g)=T_min+(T_max-T_min)*sigmoid(a0 + a1*HHI + a2*logN); HHI from TSR."
-        }
+        _meta['temperature_softmax'] = float(T_star)
         with open(meta_path, 'w') as f: json.dump(_meta, f, indent=2)
-        print(f"[INFO] 動的温度メタを保存: {meta_path}")
+        print(f"[INFO] 温度(T)をメタへ保存: {meta_path}")
 except Exception as e:
     print(f"[WARN] 温度メタ保存に失敗: {e}")
 
-print("\n[NOTE] 以降のデシル/TSR/Top-k評価は『pred_win_prob（= 動的T(g)較正済）』を使用します。")
+
+print("\n[NOTE] 以降のデシル/TSR/Top-k評価は『pred_win_prob（= softmax後・温度較正済）』を使用します。")
+
+
 
 # ---- デシル分析 ----
 def decile_table(df_src, pcol, payout_col, title):
     df = df_src[[pcol, payout_col]].copy()
+    # 同値タイの偏りを防ぐため rank→qcut
     r = df[pcol].rank(method="first")
     try:
         dec = pd.qcut(r, 10, labels=False, duplicates='drop') + 1
@@ -2123,7 +1396,11 @@ def roi_topk_per_race(df_src, pcol, payout_col, k=1):
     return float(roi), int(n)
 
 # === TSR（trifecta_support_rate）× Pred の“バリュー”可視化（追加関数） ===
+
 def _normalize_tsr_prob(df, tsr_col="trifecta_support_rate", group_keys=("date","race_code")):
+    """レース内でTSRを正規化（合計1.0）→勝率っぽいスケールに合わせる"""
+    if tsr_col not in df.columns:
+        return None
     g = df[list(group_keys)].apply(tuple, axis=1)
     s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).astype("float32")
     denom = s.groupby(g).transform("sum").replace(0, np.nan)
@@ -2131,7 +1408,24 @@ def _normalize_tsr_prob(df, tsr_col="trifecta_support_rate", group_keys=("date",
     return tsr_prob
 
 def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_support_rate", gap_ths=(0.0, 0.02, 0.05)):
+    """
+    既存のデシルと同じ切り方で、TSR関連の指標を追加表示。
+    - mean_tsr_prob: 市場（TSR）の平均“人気確率”
+    - mean_value_gap: 予測勝率 - 市場確率（+ほど割安）
+    - share_value_pos: gap>0（割安）馬の比率[%]
+    - roi_value_gap>=Xbp: gapが閾値以上のみ買った時の回収率（Xはbasis points）
+    併せて、各デシルの bets（件数）も出す。
+    """
+    if tsr_col not in df_src.columns:
+        print(f"[TSR] '{tsr_col}' が無いのでTSR分析をスキップします。")
+        return None
+
     cols_need = [pcol, payout_col, tsr_col, "date", "race_code"]
+    miss = [c for c in cols_need if c not in df_src.columns]
+    if miss:
+        print(f"[TSR] 必要列が足りません: {miss} → スキップ")
+        return None
+
     df = df_src[cols_need].copy()
 
     # レース内TSR正規化（確率スケール：合計1）
@@ -2140,6 +1434,7 @@ def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_suppo
     denom = s.groupby(gkey).transform("sum").replace(0, np.nan)
     df["tsr_prob"] = (s / denom).fillna(0.0).astype("float32")
 
+    # 既存デシル（rank→qcut）
     r = df[pcol].rank(method="first")
     try:
         dec = pd.qcut(r, 10, labels=False, duplicates='drop') + 1
@@ -2148,8 +1443,10 @@ def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_suppo
         dec = dec * 2
     df["decile"] = dec.astype(int)
 
+    # “バリュー” = 予測 - 市場
     df["value_gap"] = (df[pcol] - df["tsr_prob"]).astype("float32")
 
+    # 基本集計（まず昇順で作ってから最後に降順へ）
     agg = df.groupby("decile").agg(
         count=("date","count"),
         mean_pred=(pcol,"mean"),
@@ -2158,17 +1455,21 @@ def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_suppo
         share_value_pos=("value_gap", lambda x: (x>0).mean()*100),
     ).sort_index(ascending=True)
 
+    # gap閾値ごとに ROI と bets を index 対応で join（←ここが重要）
     for th in gap_ths:
-        bp = int(round(th * 10000))
+        bp = int(round(th * 10000))  # basis points 表示
         lab_roi  = f"roi_value_gap>={bp}bp"
         lab_bets = f"bets_gap>={bp}bp"
+
         mask = (df["value_gap"] >= th)
         grp  = df[mask].groupby("decile")
         roi_by_dec  = grp[payout_col].apply(lambda x: (x.sum() / (len(x)*BET_UNIT) * 100) if len(x)>0 else 0.0)
         bets_by_dec = grp.size()
+
         agg = agg.join(roi_by_dec.rename(lab_roi),  how="left")
         agg = agg.join(bets_by_dec.rename(lab_bets), how="left")
 
+    # 表示は降順(D10→D1)
     agg = agg.fillna(0.0).sort_index(ascending=False)
 
     print(f"\n[TSR×Pred] {title}（デシル別・市場比較）:")
@@ -2181,6 +1482,7 @@ def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_suppo
         roi = sub[payout_col].sum()/(bets*BET_UNIT)*100 if bets>0 else 0.0
         print(f"   - 全体: gap≥{th:.3f} → ROI={roi:.2f}%  bets={bets}")
 
+    # gapフィルタ下のレース内Top-k ROI（index整合は不要）
     def _roi_topk_value(df_sub, k, th):
         g = df_sub[df_sub["value_gap"]>=th].sort_values(pcol, ascending=False).groupby(["date","race_code"], sort=False)
         pick = g.head(k)
@@ -2194,6 +1496,7 @@ def decile_table_tsr_ex(df_src, pcol, payout_col, title, tsr_col="trifecta_suppo
             print(f"   - [Value gap≥{th:.3f}] Top{k}/race: ROI={r_:.2f}%  bets={n_}")
 
     return agg
+
 
 
 va_dec = decile_table(valid, "pred_win_prob", "win_payout", "Valid")
