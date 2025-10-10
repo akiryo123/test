@@ -1,0 +1,864 @@
+# ================================================
+# Stage-CAND: "複勝圏外（4着以下）確率" 生成ステージ（最終版）
+#   - 目的変数: finishing_position >= 4  (二値分類)
+#   - データ: BASE のみ（マージ不要）
+#   - 出力: cand の予測・評価・安全ガード済み除外フラグ・下流派生特徴
+#   - 方針:
+#       * cand_prob_4plus       : 温度較正後の基準p（正式）
+#       * cand_prob_4plus_bgi   : BGIのソフトブレンドp（参考。安全ガード判定専用）
+# ================================================
+import os, json, re, gc, pathlib
+import numpy as np
+import pandas as pd
+import polars as pl
+import lightgbm as lgb
+from sklearn.metrics import log_loss, roc_auc_score, brier_score_loss
+from sklearn.model_selection import KFold
+from scipy.optimize import minimize
+from sklearn.model_selection import TimeSeriesSplit # ← インポートを追加
+
+# -----------------------
+# 設定
+# -----------------------
+SEED = 42
+TARGET = "target_4plus"
+
+# BGIソフトブレンド設定（logit凸結合＋ゲート）
+USE_BGI_SOFT_BLEND = True
+BGI_COL = "bgi_norm"
+BLEND_LAMBDA = 0.20   # logit空間の混合率（0.1〜0.3推奨）
+BLEND_GATE_Q = 0.80   # BGIの分位（この分位以上のみ適用）
+BLEND_MARGIN = 0.03   # iso(bgi) - p がこの閾値超のときに適用
+
+# 既定パス（環境変数で上書き可）
+BASE_PARQUET_PATH = os.environ.get(
+    "JRA_BASE_PARQUET",
+    "/content/drive/My Drive/Colab/gpt/JRA06/JRA_base_data_2016.parquet"
+)
+ART_DIR = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_cand"
+MODEL_PATH = os.path.join(ART_DIR, "JRA_stage_cand_model.pkl")
+META_PATH  = os.path.join(ART_DIR, "JRA_stage_cand_meta.json")
+FEAT_JSON  = os.path.join(ART_DIR, "JRA_feature_cols_stage_cand.json")
+CAT_META   = os.path.join(ART_DIR, "JRA_stage_cand_cat_meta.json")
+PRED_PATH  = os.path.join(ART_DIR, "JRA_stage_cand_predictions.parquet")
+SCHEMA_PATH= os.path.join(ART_DIR, "JRA_stage_cand_schema.json")
+DERIVED_CAND_PATH = os.path.join(ART_DIR, "JRA_derived_features_from_stage_cand.parquet")
+DERIVED_CAND_SCHEMA = DERIVED_CAND_PATH.replace(".parquet","_schema.json")
+
+# モデル学習時は市場系を学習から除外（リーク/模倣防止）
+DROP_MARKET_FEATURES = True
+
+# 安全ガード（除外運用）
+THR_DEFAULT   = 0.95     # ハード除外のデフォルト閾値（運用で調整可）
+MIN_KEEP_PER_RACE = 8    # 最低残存頭数
+RESCUE_TOP_WIN_RATIO = 3 # predicted_win_ratio 上位は救済
+RESCUE_TOP_TIME_RANK = 2 # pred_time_index_rank 上位は救済（1が最良）
+RESCUE_TOP_TSR      = 0  # trifecta_support_rate 上位救済（0なら無効）
+
+# 下流の学習ウェイト: (1 - p_bad)**ALPHA  ※基準pで計算
+WEIGHT_ALPHA = 1.5
+
+np.random.seed(SEED)
+pathlib.Path(ART_DIR).mkdir(parents=True, exist_ok=True)
+
+print("◎ Stage-CAND 設定")
+print(f"  - SEED={SEED}")
+print(f"  - BASE={BASE_PARQUET_PATH}")
+print(f"  - ARTIFACTS={ART_DIR}")
+print(f"  - DROP_MARKET_FEATURES={DROP_MARKET_FEATURES}")
+print(f"  - BGI Soft Blend: use={USE_BGI_SOFT_BLEND}, lambda={BLEND_LAMBDA}, gate_q={BLEND_GATE_Q}, margin={BLEND_MARGIN}")
+
+# -----------------------
+# ユーティリティ
+# -----------------------
+def reduce_mem_usage(df, verbose=True):
+    start_mem = df.memory_usage().sum() / 1024**2
+    for col in df.columns:
+        col_type = df[col].dtype
+        if pd.api.types.is_integer_dtype(col_type):
+            cmin, cmax = df[col].min(), df[col].max()
+            if cmin >= np.iinfo(np.int8).min  and cmax <= np.iinfo(np.int8).max:   df[col] = df[col].astype(np.int8)
+            elif cmin >= np.iinfo(np.int16).min and cmax <= np.iinfo(np.int16).max: df[col] = df[col].astype(np.int16)
+            elif cmin >= np.iinfo(np.int32).min and cmax <= np.iinfo(np.int32).max: df[col] = df[col].astype(np.int32)
+            else: df[col] = df[col].astype(np.int64)
+        elif pd.api.types.is_float_dtype(col_type):
+            cmin, cmax = df[col].min(), df[col].max()
+            if cmin > np.finfo(np.float32).min and cmax < np.finfo(np.float32).max:
+                df[col] = df[col].astype(np.float32)
+            else:
+                df[col] = df[col].astype(np.float64)
+    end_mem = df.memory_usage().sum() / 1024**2
+    if verbose and start_mem > 0:
+        print(f"  - Mem. usage: {start_mem:.2f} -> {end_mem:.2f} MB ({100*(start_mem-end_mem)/start_mem:.1f}%)")
+    return df
+
+def learn_temperature(p_raw, y_true):
+    eps = 1e-15
+    p = np.clip(p_raw, eps, 1-eps)
+    logit = np.log(p / (1-p))
+    def nll(t):
+        T = t[0]
+        if T < eps: return 1e9
+        z = logit / T
+        q = 1/(1+np.exp(-z))
+        q = np.clip(q, eps, 1-eps)
+        return -(y_true*np.log(q) + (1-y_true)*np.log(1-q)).mean()
+    res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)], method='L-BFGS-B')
+    return float(res.x[0]), float(res.fun)
+
+def apply_T(p, T):
+    eps=1e-15
+    p = np.clip(p, eps, 1-eps)
+    logit = np.log(p/(1-p))
+    z = logit / max(T, eps)
+    return 1/(1+np.exp(-z))
+
+def _to_11str(x):
+    if pd.isna(x): return None
+    s = str(x)
+    s = re.sub(r"\.0$","",s)
+    return s.zfill(11)
+
+def safe_rank_desc(s):
+    # 大きいほど rank=1
+    return s.rank(method="min", ascending=False)
+
+def decile_table(df, prob_col, y_col, deciles=10, label=""):
+    # 高いほど悪い（4着以下）確率の想定
+    q = pd.qcut(df[prob_col].rank(method="first"), deciles, labels=False) + 1
+    out = []
+    for d in range(deciles, 0, -1):  # 10→1（Top=高確率）
+        mask = (q==d)
+        sub = df[mask]
+        if len(sub)==0: continue
+        out.append({
+            "decile": d,
+            "count": len(sub),
+            "mean_prob": sub[prob_col].mean(),
+            "bad_rate_4plus": sub[y_col].mean(),
+            "in3_rate": 1.0 - sub[y_col].mean(),
+        })
+    tab = pd.DataFrame(out).sort_values("decile", ascending=False)
+    print(f"\n[Decile] {label} :")
+    print(tab.to_string(index=False))
+    return tab
+
+def threshold_report(df, prob_col, y_col, pos_col, thr_list, label=""):
+    # y_col: 4着以下=1, 1-3着=0
+    y = df[y_col].values
+    pos = df[pos_col].values  # finishing_position
+    N = len(df)
+    P_bad = int((y==1).sum())
+    P_good= int((y==0).sum())
+    print(f"\n[Threshold Report] {label}  (N={N:,}, 4着以下={P_bad:,}, 1-3着={P_good:,})")
+    print("thr  | excl_share% (cnt) | capture_bad% (cnt) | mis_exclude% (cnt) | mis@1st | mis@2nd | mis@3rd")
+    print("-----+-------------------+--------------------+---------------------+---------+---------+--------")
+    for thr in thr_list:
+        excl = df[prob_col].values >= thr
+        excl_cnt = int(excl.sum())
+        # 捕捉（4着以下のうち除外できた割合/件数）
+        cap_cnt = int(((y==1)&excl).sum())
+        cap_rate= 100.0*cap_cnt/max(1,P_bad)
+        # 誤除外（1-3着のうち除外してしまった割合/件数）
+        mis_cnt = int(((y==0)&excl).sum())
+        mis_rate= 100.0*mis_cnt/max(1,P_good)
+        # 誤除外内訳
+        mis1 = int(((y==0)&excl&(pos==1)).sum())
+        mis2 = int(((y==0)&excl&(pos==2)).sum())
+        mis3 = int(((y==0)&excl&(pos==3)).sum())
+        print(f"{thr:>.2f} | {100.0*excl_cnt/max(1,N):>10.2f}% ({excl_cnt:>6,d}) | "
+              f"{cap_rate:>10.2f}% ({cap_cnt:>6,d}) | {mis_rate:>11.2f}% ({mis_cnt:>6,d}) | "
+              f"{mis1:>7,d} | {mis2:>7,d} | {mis3:>6,d}")
+
+def apply_safety_guards(df, prob_col, thr=0.95,
+                        min_keep=8,
+                        rescue_top_win_ratio=3,
+                        rescue_top_time_rank=2,
+                        rescue_top_tsr=0):
+    """
+    除外フラグ（raw）に対し、安全ガードを適用して最終フラグを返す
+    返り値: final_flag (bool Series), rescues_summary(dict)
+    """
+    df = df.copy()
+    raw = (df[prob_col] >= thr).astype(bool)
+    final = raw.copy()
+
+    # レースキー
+    KEYS = ["date","race_code"]
+    # 事前 rank 計算
+    if "predicted_win_ratio" in df.columns:
+        df["rk_win_ratio"] = df.groupby(KEYS)["predicted_win_ratio"].transform(safe_rank_desc)
+    else:
+        df["rk_win_ratio"] = np.inf
+
+    if "pred_time_index_rank" in df.columns:
+        # 1が強いと想定 → 小さいほど救済
+        df["rk_time_rank"] = df["pred_time_index_rank"].astype(float)
+    elif "pred_time_index_rank_in_race" in df.columns:
+        df["rk_time_rank"] = df["pred_time_index_rank_in_race"].astype(float)
+    else:
+        df["rk_time_rank"] = np.inf
+
+    if rescue_top_tsr>0 and "trifecta_support_rate" in df.columns:
+        df["rk_tsr"] = df.groupby(KEYS)["trifecta_support_rate"].transform(safe_rank_desc)
+    else:
+        df["rk_tsr"] = np.inf
+
+    rescue_win = rescue_time = rescue_tsr = fill_min = 0
+
+    for _, grp in df.groupby(KEYS, sort=False):
+        idx = grp.index
+        # 上位救済
+        if rescue_top_win_ratio>0 and np.isfinite(grp["rk_win_ratio"]).any():
+            keep_idx = grp.index[grp["rk_win_ratio"]<=rescue_top_win_ratio]
+            rescue_win += int(final.loc[keep_idx].sum())
+            final.loc[keep_idx] = False
+        if rescue_top_time_rank>0 and np.isfinite(grp["rk_time_rank"]).any():
+            keep_idx = grp.index[grp["rk_time_rank"]<=rescue_top_time_rank]
+            rescue_time += int(final.loc[keep_idx].sum())
+            final.loc[keep_idx] = False
+        if rescue_top_tsr>0 and np.isfinite(grp["rk_tsr"]).any():
+            keep_idx = grp.index[grp["rk_tsr"]<=rescue_top_tsr]
+            rescue_tsr += int(final.loc[keep_idx].sum())
+            final.loc[keep_idx] = False
+
+        # 最低残存頭数
+        n_keep  = int((~final.loc[idx]).sum())
+        if n_keep < min_keep:
+            # 除外候補の中から、確率が低い順に戻す
+            cand = grp.loc[final.loc[idx], prob_col].sort_values(ascending=True)
+            need = min_keep - n_keep
+            back = cand.index[:max(0,need)]
+            final.loc[back] = False
+            fill_min += len(back)
+
+    summary = {
+        "rescued_by_win_ratio": rescue_win,
+        "rescued_by_time_rank": rescue_time,
+        "rescued_by_tsr": rescue_tsr if rescue_top_tsr>0 else 0,
+        "filled_min_keep": fill_min
+    }
+    return final.astype(bool), summary
+
+# Title: 指標計算でNaN（未充填OOF）を除外
+# Description: OOFの未充填（NaN）を評価対象から外し、LogLoss/AUC/Brierを安定化。
+
+def _metrics(y, p, name):
+    m = np.isfinite(p)
+    y = np.asarray(y)[m]
+    p = np.asarray(p)[m]
+    return {
+        "name": name,
+        "logloss": log_loss(y, p),
+        "auc": roc_auc_score(y, p),
+        "brier": brier_score_loss(y, p),
+        "n": int(len(y)),
+        "pos": int(y.sum()),
+        "neg": int((1 - y).sum())
+    }
+
+
+# ---- BGIソフトブレンド用の小関数 ----
+def _logit(x, eps=1e-12):
+    x = np.clip(x, eps, 1-eps)
+    return np.log(x/(1-x))
+def _sigmoid(z):
+    return 1.0/(1.0 + np.exp(-z))
+
+# -----------------------
+# Step 1: 読み込み & ターゲット & 分割
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 1: データ読み込み & ターゲット定義 & 時系列分割")
+print("="*50)
+
+print(f"[INFO] BASE を読み込み: {BASE_PARQUET_PATH}")
+df = pl.read_parquet(BASE_PARQUET_PATH).to_pandas()
+print(f"  - loaded: shape={df.shape}")
+df = reduce_mem_usage(df)
+
+print("[INFO] date -> datetime 変換")
+df["date"] = pd.to_datetime(df["date"])
+
+# 目的変数: 4着以下=1
+if "finishing_position" not in df.columns:
+    raise ValueError("finishing_position 列が見つかりません。")
+df[TARGET] = (df["finishing_position"] >= 4).astype("int8")
+
+# 時系列分割
+df = df.sort_values("date").reset_index(drop=True)
+TRAIN_START = pd.to_datetime("2016-01-01")
+#TRAIN_START = pd.to_datetime("2022-01-01")  #短縮！！！！！！！
+VALID_START = pd.to_datetime("2023-04-01")
+VALID_END   = pd.to_datetime("2024-03-31")
+TEST_START  = pd.to_datetime("2024-04-01")
+TEST_END    = pd.to_datetime("2025-08-31")
+
+train = df[(df["date"]>=TRAIN_START) & (df["date"]<VALID_START)].copy()
+valid = df[(df["date"]>=VALID_START) & (df["date"]<=VALID_END)].copy()
+test  = df[(df["date"]>=TEST_START ) & (df["date"]<=TEST_END)].copy()
+print(f"  - ターゲット分布: {{1: {df[TARGET].mean():.6f}, 0: {1-df[TARGET].mean():.6f}}}")
+print(f"  - Train: {len(train):,}  [{train['date'].min().date()} .. {train['date'].max().date()}]")
+print(f"  - Valid: {len(valid):,}  [{valid['date'].min().date()} .. {valid['date'].max().date()}]")
+print(f"  - Test : {len(test):,}   [{test['date'].min().date()} .. {test['date'].max().date()}]")
+
+# -----------------------
+# Step 2: 特徴量選定（市場系は学習から除外）
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 2: 特徴量エンジニアリング（高カーデ対策・安全除外）")
+print("="*50)
+
+leak_cols = set([
+    "finishing_position","win_payout","place_payout","time_index",
+    "place_odds_1","win_odds","win_support_rate",
+    "date","race_code","start_time","bloodline_index",
+    TARGET,
+])
+market_like = [
+    "implied_win_odds","implied_place_odds","trifecta_support_rate",
+    "pop_horse_support_rate1","pred_odds","pred_popularity","trifecta_popularity_rank",
+    "pred_popularity_diff","popularity_bet_diff","last_popularity","win_popularity",
+    "place_popularity"
+]
+drop_list = list(leak_cols)
+if DROP_MARKET_FEATURES:
+    drop_list += [c for c in df.columns if c in market_like or "support_rate" in c.lower() or "popularity" in c.lower() or "odds" in c.lower()]
+
+feature_cols = [c for c in train.columns
+                if c not in drop_list
+                and (pd.api.types.is_numeric_dtype(train[c]) or pd.api.types.is_bool_dtype(train[c]))]
+
+print(f"  - [MARKET DROP] 除外: {len(set(drop_list)-leak_cols)} cols（例）: {list(set(drop_list)-leak_cols)[:10]}")
+print(f"  - 最終特徴量: {len(feature_cols)}（カテゴリ: 0）")
+
+# BGIの重複を学習から外す（残すのは bgi_norm とその派生）
+DUP_BGI_DROP = {"baken_out", "bgi_score"}
+feature_cols = [c for c in feature_cols if c not in DUP_BGI_DROP]
+
+with open(FEAT_JSON, "w") as f:
+    json.dump(feature_cols, f, indent=2)
+with open(CAT_META, "w") as f:
+    json.dump({"cat_cols":[]}, f, indent=2)
+print(f"  - ✅ 特徴量/メタ保存: {FEAT_JSON}, {CAT_META}")
+
+# -----------------------
+# Step 3: LightGBM 学習
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 3: LightGBM 学習")
+print("="*50)
+
+# 先に params 定義（NameError回避）
+params = {
+    "objective":"binary","metric":["binary_logloss","auc"],
+    "learning_rate":0.01,"num_leaves":80,
+    "feature_fraction":0.7,"bagging_fraction":0.7,"bagging_freq":2,
+    "min_data_in_leaf":900,"lambda_l1":0.1,"lambda_l2":1.0,
+    "seed":SEED,"verbosity":-1,"n_jobs":-1
+}
+
+# 単調制約（bgi_norm 系・predicted_win_ratio 等は「大きいほど悪い」）
+# タイトル: 単調制約リストの構築（bgi系は+1、predicted_win_ratioは-1）
+# 説明:
+#   LightGBM の monotone_constraints を特徴量名ルールで自動生成します。
+#   - POS_PATTERNS: 値が大きいほど「4着以下になりやすい」= 目的確率↑ ⇒ 制約 +1
+#   - NEG_PATTERNS: 値が大きいほど「良い/勝ちやすい」= 目的確率↓ ⇒ 制約 -1
+#   返り値は各特徴量に対する {-1, 0, +1} の配列です。
+
+def build_monotone_constraints(feat_names):
+    POS_PATTERNS = (
+        "bgi_norm",
+        "bgi_norm_diff_from_mean",
+        "bgi_norm_z_in_race",
+        "bgi_norm_rank_ratio",
+        "bgi_gap_med",
+        # "predicted_win_ratio",  # ← +1 対象から除外（大きいほど良いと解釈）
+    )
+
+    # 追加：大きいほど良い（勝ちやすい）→ 4着以下確率は下がる ⇒ -1
+    NEG_PATTERNS = ()
+
+    cons = []
+    for f in feat_names:
+        if any(f == p or f.startswith(p + "_") for p in POS_PATTERNS):
+            cons.append(+1)
+        else:
+            cons.append(0)   # ← predicted_win_ratio はここに落ちる（= 無拘束）
+    return cons
+
+
+# 単調制約の適用（既存の params / feature_cols を利用）
+mono = build_monotone_constraints(feature_cols)
+if any(v != 0 for v in mono):
+    params["monotone_constraints"] = mono
+    plus_cnt  = sum(1 for v in mono if v == +1)
+    minus_cnt = sum(1 for v in mono if v == -1)
+    print(f"[INFO] monotone constraints: +1 count={plus_cnt}, -1 count={minus_cnt}, len={len(mono)}")
+
+
+# → ログ肥大防止のため constraints リスト本体は出力しない
+params_log = dict(params)
+if "monotone_constraints" in params_log:
+    params_log["monotone_constraints"] = f"<list len={len(mono)}, +1 count={sum(mono)}>"
+print("[INFO] params:")
+print(json.dumps(params_log, indent=2))
+
+lgb_train = lgb.Dataset(train[feature_cols], label=train[TARGET])
+lgb_valid = lgb.Dataset(valid[feature_cols], label=valid[TARGET], reference=lgb_train)
+
+evals_result={}
+model = lgb.train(
+    params, lgb_train, num_boost_round=2000,
+    valid_sets=[lgb_train,lgb_valid], valid_names=["train","valid"],
+    callbacks=[lgb.early_stopping(stopping_rounds=25, first_metric_only=True),
+               lgb.record_evaluation(evals_result),
+               lgb.log_evaluation(period=100)]
+)
+best_iter = model.best_iteration
+print(f"[INFO] 学習完了. best_iter={best_iter}")
+model.save_model(MODEL_PATH)
+with open(META_PATH,"w") as f:
+    json.dump({"best_iter":best_iter,"params":params}, f, indent=2)
+print(f"  - ✅ 保存: {MODEL_PATH}")
+
+# -----------------------
+# Step 4: OOF 予測（TimeSeriesSplit, n_splits=5）
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 4: OOF 予測（TimeSeriesSplit, n_splits=5）")
+print("="*50)
+
+from sklearn.model_selection import TimeSeriesSplit
+
+n_splits = 5  # ← ここを 5 に
+tscv = TimeSeriesSplit(n_splits=n_splits)
+oof = np.full(len(train), np.nan, dtype=np.float64)
+best_iters = []
+
+for fold, (tr_idx, va_idx) in enumerate(tscv.split(train), 1):
+    tr_dates = train.iloc[tr_idx]['date']
+    va_dates = train.iloc[va_idx]['date']
+    print(f"  - Fold {fold}/{n_splits} | train<=[{tr_dates.max().date()}] -> "
+          f"valid[{va_dates.min().date()}~{va_dates.max().date()}] "
+          f"({len(tr_idx)}→{len(va_idx)})")
+
+    dtr = lgb.Dataset(train.iloc[tr_idx][feature_cols], label=train.iloc[tr_idx][TARGET])
+    dva = lgb.Dataset(train.iloc[va_idx][feature_cols],   label=train.iloc[va_idx][TARGET])
+
+    fm = lgb.train(
+        params, dtr, num_boost_round=2000,
+        valid_sets=[dva], valid_names=["valid_fold"],
+        callbacks=[lgb.early_stopping(stopping_rounds=25),
+                   lgb.log_evaluation(period=0)]
+    )
+    best_iters.append(int(fm.best_iteration or 200))
+    oof[va_idx] = fm.predict(train.iloc[va_idx][feature_cols], num_iteration=fm.best_iteration)
+
+num_filled = int(np.isfinite(oof).sum())
+num_total  = int(len(oof))
+print(f"[INFO] OOF filled: {num_filled:,}/{num_total:,} "
+      f"({100.0*num_filled/max(1,num_total):.1f}%), "
+      f"best_iter(median/mean)={np.median(best_iters):.0f}/{np.mean(best_iters):.1f}")
+
+assert num_filled > 0, "OOFが全てNaNです。TimeSeriesSplitの設定を確認してください。"
+
+
+
+# -----------------------
+# Step 5: 温度スケーリング（確率較正）
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 5: 温度スケーリング（確率較正）")
+print("="*50)
+valid_raw = model.predict(valid[feature_cols], num_iteration=best_iter)
+T, nll = learn_temperature(valid_raw, valid[TARGET].values)
+print(f"[INFO] 学習した温度 T={T:.4f} (NLL={nll:.5f})")
+
+# -----------------------
+# Step 6: 評価（基準p） & 参考：BGIソフトブレンド
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 6: 評価 & 予測保存")
+print("="*50)
+
+# 6.1 基準p（正式）
+train_cal = apply_T(oof, T)               # OOFにはNaN（未充填）が含まれる可能性あり
+valid_cal = apply_T(valid_raw, T)
+test_raw  = model.predict(test[feature_cols], num_iteration=best_iter)
+test_cal  = apply_T(test_raw, T)
+
+# === PATCH: OOF未充填（先頭バーンイン）だけ、最終モデル予測で穴埋め（温度較正後） ===
+pred_train_full = model.predict(train[feature_cols], num_iteration=best_iter)
+pred_train_full_cal = apply_T(pred_train_full, T)
+
+mask_oof  = np.isfinite(train_cal)  # True: OOFあり, False: バーンイン未充填
+train_any = np.where(mask_oof, train_cal, pred_train_full_cal).astype("float32")
+
+fallback_rate = 100.0 * (~mask_oof).mean()
+print(f"[INFO] OOF fallback (burn-in only): filled {fallback_rate:.2f}% of train with pred_train_full_cal")
+# === /PATCH ===
+
+
+# --- ここが重要：Train(OOF)はNaN（未充填）を除外して評価する ---
+mask_tr = np.isfinite(train_cal)
+print(f"[INFO] Train(OOF) usable predictions: {int(mask_tr.sum()):,}/{len(train_cal):,} "
+      f"({100.0*mask_tr.mean():.1f}%)")
+
+m_tr = _metrics(train[TARGET].values[mask_tr], train_cal[mask_tr], "Train(OOF)")
+m_va = _metrics(valid[TARGET], valid_cal, "Valid")
+m_te = _metrics(test[TARGET],  test_cal,  "Test")
+
+print("\n[INFO] モデル評価（基準p/温度較正後）")
+print("Split        |    N   |  4着以下 | 1-3着 | LogLoss |   AUC   |  Brier")
+print("-------------+--------+---------+-------+---------+---------+--------")
+for m in [m_tr,m_va,m_te]:
+    print(f"{m['name']:<12} | {m['n']:>6,d} | {m['pos']:>7,d} | {m['neg']:>5,d} | "
+          f"{m['logloss']:.5f} | {m['auc']:.5f} | {m['brier']:.5f}")
+
+# 6.2 参考：BGIソフトブレンド（安全ガード判定専用）
+# Title: BGIソフトブレンドのゲート分位を学習期間で固定する修正
+# Description:
+#   これまで各splitごとに bgi の分位（gate_q）を再計算していましたが、
+#   期間偏りでゲートが極端化するのを防ぐため、学習期間（train）の分布で一度だけ求め、
+#   以後の適用（train/valid/test）ではその固定値を使い回します。
+
+m_tr_bgi = m_va_bgi = m_te_bgi = None
+train_bgi = valid_bgi = test_bgi = None
+
+if USE_BGI_SOFT_BLEND and (BGI_COL in train.columns):
+    from sklearn.isotonic import IsotonicRegression
+
+    def learn_bgi_isotonic(df_list, target_col=TARGET, bgi_col=BGI_COL):
+        df_join = pd.concat(df_list, axis=0, ignore_index=True)
+        m = df_join[bgi_col].notna() & df_join[target_col].notna()
+        if m.sum() == 0:
+            return None
+        ir = IsotonicRegression(y_min=0.0, y_max=1.0, increasing=True, out_of_bounds="clip")
+        ir.fit(
+            df_join.loc[m, bgi_col].astype(float).values,
+            df_join.loc[m, target_col].astype(float).values
+        )
+        return ir
+
+    def apply_bgi_blend_soft(p, bgi, ir, lam=BLEND_LAMBDA, gate_q=BLEND_GATE_Q, margin=BLEND_MARGIN, fixed_q=None):
+        p = np.asarray(p, dtype=float)
+        bgi = np.asarray(bgi, dtype=float)
+        base = np.full_like(p, np.nan)
+        mask = ~np.isnan(bgi)
+        if ir is not None and mask.any():
+            base[mask] = ir.predict(bgi[mask])
+        # logit空間の凸結合（上振れ時のみ）
+        p_soft = _sigmoid((1 - lam) * _logit(p) + lam * _logit(np.nan_to_num(base, nan=p)))
+        # ゲート（bgiが高位・差分が一定超）
+        if fixed_q is None:
+            try:
+                q = np.nanquantile(bgi, gate_q)
+            except Exception:
+                q = np.nan
+        else:
+            q = fixed_q
+        use = (bgi >= q) & ((base - p) > margin)
+        return np.where(use, p_soft, p)
+
+    print("\n[INFO] Isotonic baseline を学習（bgi_norm→4着以下確率; soft blend, gated）...")
+    # ※ここは元コードどおり：train+valid を結合してアイソトニックを学習（本修正の対象外）
+    ir_bgi = learn_bgi_isotonic(
+        [train[[TARGET, BGI_COL]], valid[[TARGET, BGI_COL]]],
+        target_col=TARGET, bgi_col=BGI_COL
+    )
+
+    # ★学習期間(train)でゲート分位を一度だけ算出し、以後は固定値を使用
+    try:
+        q_gate = np.nanquantile(train[BGI_COL].values.astype(float), BLEND_GATE_Q)
+    except Exception:
+        q_gate = np.nan
+
+# --- today 再現用に Isotonic と gate 実数値を保存 ---
+try:
+    import pickle as pkl
+    ISO_PATH = os.path.join(ART_DIR, "JRA_stage_cand_iso.pkl")
+    with open(ISO_PATH, "wb") as f:
+        pkl.dump(ir_bgi, f)
+    print(f"[INFO] Saved BGI isotonic: {ISO_PATH}")
+
+    BGI_GATE_JSON = os.path.join(ART_DIR, "JRA_stage_cand_bgi_gate.json")
+    with open(BGI_GATE_JSON, "w") as f:
+        json.dump({"q_gate": float(q_gate), "gate_q": float(BLEND_GATE_Q)}, f)
+    print(f"[INFO] Saved BGI gate threshold: {BGI_GATE_JSON}")
+except Exception as e:
+    print(f"[WARN] Failed to persist isotonic/gate info: {e}")
+
+
+
+
+    # （置換後：OOF優先→バーンインのみpredで埋めた any を基準に）
+    train_bgi = apply_bgi_blend_soft(
+        train_any, train[BGI_COL].values, ir_bgi,
+        lam=BLEND_LAMBDA, gate_q=BLEND_GATE_Q, margin=BLEND_MARGIN, fixed_q=q_gate
+    )
+
+    valid_bgi = apply_bgi_blend_soft(
+        valid_cal, valid[BGI_COL].values, ir_bgi,
+        lam=BLEND_LAMBDA, gate_q=BLEND_GATE_Q, margin=BLEND_MARGIN, fixed_q=q_gate
+    )
+    test_bgi  = apply_bgi_blend_soft(
+        test_cal,
+        (test[BGI_COL].values if BGI_COL in test.columns else np.full(len(test_cal), np.nan)),
+        ir_bgi,
+        lam=BLEND_LAMBDA, gate_q=BLEND_GATE_Q, margin=BLEND_MARGIN, fixed_q=q_gate
+    )
+
+    # 適用率
+    pct = lambda x: 100.0 * x
+    print(f"[INFO] BGIソフトブレンド適用率: "
+          f"Train {pct((train_bgi > train_cal).mean()):.1f}% | "
+          f"Valid {pct((valid_bgi > valid_cal).mean()):.1f}% | "
+          f"Test {pct((test_bgi > test_cal).mean()):.1f}%")
+
+    # 参考指標（評価はあくまで基準pを正式採用）※TrainはNaN除外
+    mask_tr_bgi = np.isfinite(train_bgi)
+    m_tr_bgi = _metrics(train[TARGET].values[mask_tr_bgi], train_bgi[mask_tr_bgi], "Train(BGIsoft)")
+    m_va_bgi = _metrics(valid[TARGET], valid_bgi, "Valid(BGIsoft)")
+    m_te_bgi = _metrics(test[TARGET],  test_bgi,  "Test(BGIsoft)")
+    print("\n[REF] モデル評価（BGIソフトブレンド; 参考）")
+    print("Split           | LogLoss |   AUC   |  Brier")
+    print("----------------+---------+---------+--------")
+    for m in [m_tr_bgi, m_va_bgi, m_te_bgi]:
+        print(f"{m['name']:<15} | {m['logloss']:.5f} | {m['auc']:.5f} | {m['brier']:.5f}")
+
+# 6.3 レポート（基準pで出力）
+THRS = [0.70,0.80,0.90,0.95]
+
+# --- Train(OOF) はNaN除外で閾値レポート ---
+threshold_report(
+    train.loc[mask_tr].assign(p=train_cal[mask_tr]),
+    "p", TARGET, "finishing_position", THRS, "Train(OOF)"
+)
+
+# Valid/Testは従来通り
+threshold_report(valid.assign(p=valid_cal), "p", TARGET, "finishing_position", THRS, "Valid")
+threshold_report(test.assign(p=test_cal),   "p", TARGET, "finishing_position", THRS, "Test")
+
+# DecileはValid/Testのみ（Trainで出す場合はmask_trを同様に適用）
+decile_table(valid.assign(p=valid_cal), "p", TARGET, 10, "Valid")
+decile_table(test.assign(p=test_cal),   "p", TARGET, 10, "Test")
+
+# --- 分布パーセンタイル：TrainはNaN除外 ---
+def pctiles(x):
+    q=[0,1,5,10,25,50,75,90,95,99,100]
+    v=np.percentile(x, q)
+    return dict(zip([f"p{int(qq)}" for qq in q], v))
+
+def pctiles_na(x):
+    x = np.asarray(x)
+    x = x[np.isfinite(x)]
+    return pctiles(x)
+
+pt_tr = pctiles_na(train_cal)
+pt_va = pctiles(valid_cal)
+pt_te = pctiles(test_cal)
+
+print("\n[INFO] 予測分布パーセンタイル（基準p・較正後）")
+print(f"  - Train(OOF): min={pt_tr['p0']:.3f}  p1={pt_tr['p1']:.3f}  p5={pt_tr['p5']:.3f}  p10={pt_tr['p10']:.3f}  p25={pt_tr['p25']:.3f}  p50={pt_tr['p50']:.3f}  p75={pt_tr['p75']:.3f}  p90={pt_tr['p90']:.3f}  p95={pt_tr['p95']:.3f}  p99={pt_tr['p99']:.3f}  max={pt_tr['p100']:.3f}")
+print(f"  - Valid     : min={pt_va['p0']:.3f}  p1={pt_va['p1']:.3f}  p5={pt_va['p5']:.3f}  p10={pt_va['p10']:.3f}  p25={pt_va['p25']:.3f}  p50={pt_va['p50']:.3f}  p75={pt_va['p75']:.3f}  p90={pt_va['p90']:.3f}  p95={pt_va['p95']:.3f}  p99={pt_va['p99']:.3f}  max={pt_va['p100']:.3f}")
+print(f"  - Test      : min={pt_te['p0']:.3f}  p1={pt_te['p1']:.3f}  p5={pt_te['p5']:.3f}  p10={pt_te['p10']:.3f}  p25={pt_te['p25']:.3f}  p50={pt_te['p50']:.3f}  p75={pt_te['p75']:.3f}  p90={pt_te['p90']:.3f}  p95={pt_te['p95']:.3f}  p99={pt_te['p99']:.3f}  max={pt_te['p100']:.3f}")
+
+# 重要度 Top 30
+imp = pd.DataFrame({"feature": model.feature_name(),
+                    "gain": model.feature_importance(importance_type="gain")})\
+      .sort_values("gain", ascending=False)
+print("\n[INFO] Feature Importance (Top 30 by Gain)")
+print(imp.head(30).to_string(index=False))
+
+# -----------------------
+# Step 6.9: “最終確率の定義”
+#   * cand_prob_4plus        : 基準p（正式）
+#   * cand_prob_4plus_bgi    : BGIソフトブレンドp（参考。除外判定にのみ使用）
+#   * 断片化Warning低減のため、一括連結で列追加
+# -----------------------
+df_all = pd.concat([train, valid, test], ignore_index=True)
+
+# 監査用に OOF / Pred も残したい場合は列追加（任意）
+train_oof_or_nan     = train_cal.astype("float32")
+train_pred_full_c    = pred_train_full_cal.astype("float32")
+
+# ← ここは “1行の簡潔版” だけ残す（上のダミー連結は削除）
+all_prob_any = np.concatenate([train_any, valid_cal, test_cal]).astype("float32")
+
+# BGIブレンドはそのまま（train_bgi は train_any を基に上で作成済み）
+if USE_BGI_SOFT_BLEND and (train_bgi is not None):
+    all_prob_bgi = np.concatenate([train_bgi, valid_bgi, test_bgi]).astype("float32")
+else:
+    all_prob_bgi = all_prob_any.copy()
+
+# 監査列（任意）
+all_prob_oof  = np.concatenate([train_oof_or_nan,   valid_cal, test_cal]).astype("float32")
+all_prob_pred = np.concatenate([train_pred_full_c,  valid_cal, test_cal]).astype("float32")
+
+df_new = pd.DataFrame({
+    "cand_prob_4plus":       all_prob_any,   # ← 下流はこの“any”を正式採用
+    "cand_prob_4plus_bgi":   all_prob_bgi,   # ← Safety 判定用
+    "cand_prob_4plus_oof":   all_prob_oof,   # （任意）
+    "cand_prob_4plus_pred":  all_prob_pred,  # （任意）
+}, index=df_all.index)
+
+
+df_all = pd.concat([df_all, df_new], axis=1)
+
+
+
+# -----------------------
+# Step 7: 下流派生特徴の作成（基準pで作成）
+#   * 断片化Warning低減のため、派生列もまとめて結合
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 7: 下流派生特徴（CAND）作成")
+print("="*50)
+
+RKEYS = ["date","race_code"]
+MERGE_KEYS = ["date","race_code","horse_number"]
+
+# レース内統計（基準p）
+grp_mean = df_all.groupby(RKEYS)["cand_prob_4plus"].transform("mean")
+grp_std  = df_all.groupby(RKEYS)["cand_prob_4plus"].transform("std")
+grp_med  = df_all.groupby(RKEYS)["cand_prob_4plus"].transform("median")
+rk_bad   = df_all.groupby(RKEYS)["cand_prob_4plus"].rank(method="min", ascending=False)
+
+deriv = pd.DataFrame({
+    "keep_prob_in3": (1.0 - df_all["cand_prob_4plus"]).astype("float32"),
+    "cand_bad_rank_in_race": rk_bad.astype("float32"),
+    "cand_bad_z": ((df_all["cand_prob_4plus"] - grp_mean) / (grp_std.replace(0,np.nan))).astype("float32"),
+    "cand_bad_gap": (df_all["cand_prob_4plus"] - grp_med).astype("float32"),
+    "exclude_margin_090": (df_all["cand_prob_4plus"] - 0.90).astype("float32"),
+    "exclude_margin_095": (df_all["cand_prob_4plus"] - 0.95).astype("float32"),
+    "bottom3_by_cand": (rk_bad <= 3).astype("int8"),
+    "sample_weight_cand": ((1.0 - df_all["cand_prob_4plus"])**WEIGHT_ALPHA).astype("float32"),
+}, index=df_all.index)
+df_all = pd.concat([df_all, deriv], axis=1)
+
+# 6) 安全ガード付きの除外フラグ（※判定は BGIソフトブレンドp）
+print(f"[INFO] 安全ガードを適用（thr={THR_DEFAULT}, min_keep={MIN_KEEP_PER_RACE}, rescue: win_ratio≤{RESCUE_TOP_WIN_RATIO}, time_rank≤{RESCUE_TOP_TIME_RANK}, tsr_top={RESCUE_TOP_TSR}）")
+final_flag, summary = apply_safety_guards(
+    df_all, "cand_prob_4plus_bgi", thr=THR_DEFAULT,
+    min_keep=MIN_KEEP_PER_RACE,
+    rescue_top_win_ratio=RESCUE_TOP_WIN_RATIO,
+    rescue_top_time_rank=RESCUE_TOP_TIME_RANK,
+    rescue_top_tsr=RESCUE_TOP_TSR
+)
+df_all = pd.concat([df_all, pd.Series(final_flag.astype("int8"), name="exclude_flag_095", index=df_all.index)], axis=1)
+print("[INFO] Safety Guards summary:", summary)
+
+# -----------------------
+# Step 8: 最小エクスポート（キー＋派生列）
+# -----------------------
+print("\n" + "="*50)
+print("◎ Step 8: CAND派生の最小エクスポート")
+print("="*50)
+
+EXPORT_COLS_CORE = [
+    "cand_prob_4plus","keep_prob_in3",
+    "cand_bad_rank_in_race","cand_bad_z","cand_bad_gap",
+    "exclude_margin_090","exclude_margin_095",
+    "bottom3_by_cand","sample_weight_cand","exclude_flag_095"
+]
+EXPORT_COLS = [c for c in EXPORT_COLS_CORE if c in df_all.columns]
+
+df_export = df_all[MERGE_KEYS + EXPORT_COLS].copy()
+
+# キー正規化
+df_export["date"] = pd.to_datetime(df_export["date"], errors="coerce").dt.tz_localize(None)
+df_export["race_code"] = df_export["race_code"].apply(_to_11str).astype(str)
+df_export["horse_number"] = pd.to_numeric(df_export["horse_number"], errors="coerce").astype("Int64")
+
+# dtype 最適化
+for c in EXPORT_COLS:
+    if pd.api.types.is_float_dtype(df_export[c]): df_export[c] = df_export[c].astype("float32")
+    if pd.api.types.is_integer_dtype(df_export[c]): df_export[c] = df_export[c].astype("Int32")
+
+# 重複キーがあれば平均
+if df_export.duplicated(MERGE_KEYS).any():
+    num_cols = [c for c in df_export.columns if c not in MERGE_KEYS]
+    df_export = df_export.groupby(MERGE_KEYS, as_index=False)[num_cols].mean()
+
+# 保存
+try:
+    pl.from_pandas(df_export).write_parquet(DERIVED_CAND_PATH, compression="zstd")
+except Exception:
+    df_export.to_parquet(DERIVED_CAND_PATH, index=False, engine="pyarrow", compression="zstd")
+
+print(f"  - ✅ 保存: {DERIVED_CAND_PATH}  shape={df_export.shape}")
+
+# スキーマ契約
+schema = {
+    "merge_keys": MERGE_KEYS,
+    "value_cols": EXPORT_COLS,
+    "dtypes": {c:str(df_export[c].dtype) for c in df_export.columns},
+    "n_rows": int(len(df_export)),
+    "n_cols": int(df_export.shape[1]),
+    "params": {
+        "thr_default": THR_DEFAULT,
+        "min_keep_per_race": MIN_KEEP_PER_RACE,
+        "rescue_top_win_ratio": RESCUE_TOP_WIN_RATIO,
+        "rescue_top_time_rank": RESCUE_TOP_TIME_RANK,
+        "rescue_top_tsr": RESCUE_TOP_TSR,
+        "weight_alpha": WEIGHT_ALPHA,
+        "use_bgi_soft_blend": USE_BGI_SOFT_BLEND,
+        "blend_lambda": BLEND_LAMBDA,
+        "blend_gate_q": BLEND_GATE_Q,
+        "blend_margin": BLEND_MARGIN
+    }
+}
+with open(DERIVED_CAND_SCHEMA,"w",encoding="utf-8") as f:
+    json.dump(schema, f, ensure_ascii=False, indent=2)
+print(f"  - ✅ スキーマ保存: {DERIVED_CAND_SCHEMA}")
+
+# CAND 推論用スキーマ（today側が参照する契約情報）
+schema_cand = {
+    "model_path": MODEL_PATH,
+    "feature_cols_json": FEAT_JSON,
+    "cat_meta_json": CAT_META,
+    "merge_keys": ["date","race_code","horse_number"],
+    "calibration": {"temperature": float(T)},
+    "bgi_soft_blend": {
+        "use": bool(USE_BGI_SOFT_BLEND),
+        "blend_lambda": float(BLEND_LAMBDA),
+        "blend_gate_q": float(BLEND_GATE_Q),
+        "blend_margin": float(BLEND_MARGIN),
+        "gate_value": (float(q_gate) if 'q_gate' in locals() else None),
+        "iso_path": (ISO_PATH if 'ISO_PATH' in locals() else None),
+        "gate_json": (BGI_GATE_JSON if 'BGI_GATE_JSON' in locals() else None)
+    },
+    "export_derived_path": DERIVED_CAND_PATH,
+    "export_derived_schema": DERIVED_CAND_SCHEMA
+}
+with open(SCHEMA_PATH, "w", encoding="utf-8") as f:
+    json.dump(schema_cand, f, ensure_ascii=False, indent=2)
+print(f"  - ✅ スキーマ保存: {SCHEMA_PATH}")
+
+
+# 予測フル保存（解析用）※基準pで保存（下流整合）
+pred_pack = pd.concat([
+    train[["date","race_code","horse_number","finishing_position",TARGET]].assign(split="train_oof",  prob=train_cal),
+    valid[["date","race_code","horse_number","finishing_position",TARGET]].assign(split="valid_pred", prob=valid_cal),
+    test[ ["date","race_code","horse_number","finishing_position",TARGET]].assign(split="test_pred",  prob=test_cal),
+], ignore_index=True)
+try:
+    pl.from_pandas(pred_pack).write_parquet(PRED_PATH, compression="zstd")
+except Exception:
+    pred_pack.to_parquet(PRED_PATH, index=False, engine="pyarrow", compression="zstd")
+print(f"[INFO] ✅ 予測保存: {PRED_PATH}  shape={pred_pack.shape}")
+
+# 指標メタ保存
+with open(META_PATH,"r") as f:
+    meta = json.load(f)
+meta.update({
+    "temperature": T,
+    "metrics": {"train": m_tr, "valid": m_va, "test": m_te},
+    "metrics_bgi_soft": ({"train": m_tr_bgi, "valid": m_va_bgi, "test": m_te_bgi} if (USE_BGI_SOFT_BLEND and (m_tr_bgi is not None)) else None),
+    "safety_summary": summary
+})
+with open(META_PATH,"w") as f:
+    json.dump(meta, f, indent=2)
+
+print("\n--- Stage-CAND Finished ---")
