@@ -1,0 +1,954 @@
+# ─────────────────────────────────────────────
+# Phase-1 : Base Parquet 作成スクリプト (JRA06 Ver.)
+# ─────────────────────────────────────────────
+import polars as pl
+import unicodedata as _ud
+import json, re, time, shutil, os
+import math
+import csv
+from pathlib import Path
+# 統計量計算のために必要なライブラリをインポート (Polars に含まれない統計量など)
+# from scipy.stats import skew, kurtosis # Polars で計算できるため不要
+
+# ── 入出力パス  ───────────────────────────
+DATA_CSV = "/content/drive/My Drive/Colab/gpt/JRA06/JRA_AI_GPT06_2016.csv"
+BASE_PARQUET = "/content/drive/My Drive/Colab/gpt/JRA06/JRA_base_data_2016.parquet"
+J2E_JSON = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_place/j2e.json"
+AUDIT_META_CSV = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_phase1/audit_meta.csv"
+
+
+# ── 日本語→英語マッピング辞書  ──
+# ==========================================================
+# 1) 日本語 → 英語 変換辞書 (種類別整理 + 全項目網羅版)
+# ==========================================================
+j2e = {
+    # --- レース基本情報 (Race Basic Info) ---
+    "競走コード": "race_code",
+    "年月日": "date",
+    "月度": "month", # 月度 (e.g., 1-12)
+    "競走番号": "race_number", # レース番号 (e.g., 1-12)
+    "場コード": "venue_code", # 競馬場コード
+    "トラック種別コード": "track_surface_code", # 馬場種別コード (芝/ダート/障害)
+    "トラックコード": "track_code", # コースコード (内/外/直線など)
+    "距離": "distance", # 距離 (m)
+    "発走時刻": "start_time", # 発走時刻
+    "回次": "meeting_order", # 開催回次 (例: 第1回)
+    "日次": "day_order", # 開催日次 (例: 1日)
+    "グレードコード": "grade_code", # レースグレードコード (G1, G2, etc.)
+    "競走種別コード": "race_type_code", # 競走種別コード (平地/障害など)
+    "競走条件コード": "race_condition_code", # 競走条件コード (オープン/A級/3歳未勝利など)
+    "競走条件名称A": "race_condition_name_a", # 競走条件名称A (簡易版)
+    "競走条件名称": "race_condition_name", # 競走条件名称 (正式版)
+    "頭数": "num_horses", # 出走頭数
+    "初出走頭数": "num_first_runners", # 初出走頭数 (同レース内)
+    "逃げ馬頭数": "num_front_runners", # 逃げ馬頭数 (同レース内)
+    "重量種別コード": "weight_type_code", # 重量種別コード (ハンデ/別定/定量)
+
+    # --- 馬の基本情報 (Horse Basic Info) ---
+    "馬番": "horse_number", # 馬番
+    "馬番2": "horse_number_v2", # 馬番2 (別の表現？)
+    "性別コード": "sex_code", # 性別コード
+    "馬齢": "horse_age", # 馬齢 (整数)
+    "競走馬年齢": "horse_age_dec", # 競走馬年齢 (小数、例: 3.5歳)
+    "キャリア": "career", # 総キャリア出走回数
+    "キャリア3": "career_v3", # キャリア3 (別の定義？)
+    "キャリア3平均": "career_v3_mean", # キャリア3平均
+    "馬体重": "body_weight", # 馬体重 (kg)
+    "馬体重増減": "body_weight_diff", # 馬体重増減 (kg) (前走比)
+    "負担重量": "weight_carried", # 負担重量 (kg)
+    "距離増減": "distance_change", # 距離増減 (m) (前走比)
+    "休養週数": "rest_weeks", # 休養週数 (前走から)
+    "休養後出走回数": "runs_since_layoff", # 休養後出走回数
+    "転厩": "stable_transfer_flag", # 転厩フラグ
+    "馬記号コード": "horse_mark_code", # 馬記号コード (アローなど)
+    "毛色コード": "coat_color_code", # 毛色コード
+    "生産者名": "breeder_name", # 生産者名
+    "産地名": "birthplace", # 産地名
+    "馬主名": "owner_name", # 馬主名
+    "連対率": "place_rate", # 生涯連対率 (単体馬の複勝率?)
+    "今回の距離連対率": "place_rate_distance", # 今回距離での連対率
+    "今回の距離出走比率": "start_ratio_distance", # 今回距離での出走比率
+    "初出走場コード": "first_race_venue_code", # 初出走競馬場コード
+    "所属": "training_center", # 所属 (美浦/栗東など)
+
+    # --- オッズ・配当情報 (Odds / Payout Info) ---
+    "単勝オッズ": "win_odds", # 単勝オッズ (確定オッズに近いもの)
+    "単勝配当": "win_payout", # 単勝配当 (確定)
+    "複勝配当": "place_payout", # 複勝配当 (確定)
+    "複勝オッズ1": "place_odds_1", # 複勝オッズ1 (確定オッズに近いもの)
+    "単勝人気": "win_popularity", # 単勝人気 (確定人気に近いもの)
+    "単勝支持率": "win_support_rate", # 単勝支持率 (確定支持率に近いもの)
+    "三連単支持率": "trifecta_support_rate", # 三連単支持率 (確定支持率に近いもの)
+    "単勝支持率差": "win_support_rate_diff", # 単勝支持率差
+    "単勝比率": "win_ratio", # 単勝比率
+    "予想オッズ": "pred_odds", # 予想オッズ (馬王Zなど事前計算)
+    "予想人気": "pred_popularity", # 予想人気 (馬王Zなど事前計算)
+    "本賞金1": "prize_money_1", # 本賞金1着額
+    "単勝推定オッズ": "implied_win_odds",   # 三連単支持率から逆算した単勝オッズ
+    "複勝推定オッズ": "implied_place_odds", # 三連単支持率から逆算した複勝オッズ
+
+    # --- 着順情報 (Finishing Position Info) ---
+    "確定着順": "finishing_position",
+    "前走着順": "last_finish",
+    "前走着順A": "last_finish_a",
+    "前々走着順": "two_back_finish",
+    "三前走着順": "three_back_finish",
+
+    # --- 予想/評価/指数 (Prediction / Evaluation / Index) ---
+    "タイム指数": "time_index",
+    "予想タイム指数": "pred_time_index",
+    "予想タイム偏差値": "pred_time_dev",
+    "予想タイム指数順位": "pred_time_index_rank",
+    "予想ダッシュ指数": "pred_dash_index",
+    "予想ダッシュ指数A": "pred_dash_index_A",
+    "予想ダッシュ指数順位": "pred_dash_rank",
+    "得点": "score",
+    "得点偏差値": "score_dev",
+    "得点標準偏差A": "score_std_a",
+    "得点標準偏差": "score_std",
+    "得点W": "score_w",
+    "得点ver3": "score_ver3",
+    "得点V1": "score_v1",
+    "得点V2": "score_v2",
+    "得点V3": "score_v3",
+    "得点V1順位": "score_v1_rank",
+    "得点V2順位": "score_v2_rank",
+    "得点V3順位": "score_v3_rank",
+    "馬券評価順位": "bet_eval_rank",
+    "馬券評価順位B": "bet_eval_rank_b",
+    "予想勝ち指数": "pred_win_index",
+    "先行指数": "early_speed_index",
+    "先行指数順位": "early_speed_rank",
+    "先行指数A": "early_speed_index_a",
+    "予想タイム平均": "pred_time_mean",
+    "騎手評価": "jockey_rating",
+    "調教師評価": "trainer_rating",
+    "枠順評価": "draw_rating",
+    "脚質評価": "running_style_rating",
+    "一番人気信頼度": "fav_confidence",
+    "競馬場ランク": "venue_rank",
+    "パドック評価": "paddock_rating",
+    "デフォルト得点": "default_score",
+    "デフォルト得点順位": "default_score_rank",
+    "予想展開": "pred_race_shape",
+    "枠展開": "draw_development",
+    "展開差": "development_diff",
+    "ペース展開": "pace_development",
+
+    # --- 過去走情報 (Past Race Info) ---
+    "前走頭数": "last_field_size",
+    "前走場コード": "last_venue_code",
+    "前走ペース偏差値": "last_pace_dev",
+    "前走展開": "last_race_shape",
+    "前走上がり順位": "last_final_3f_rank",
+    "前走タイム指数": "last_time_index",
+    "前走得点": "last_score",
+    "前々走人気": "two_back_popularity",
+    "前々走ペース偏差値": "two_back_pace_dev",
+    "前々走展開": "two_back_race_shape",
+    "前々走タイム指数": "two_back_time_index",
+    "三前走人気": "three_back_popularity",
+    "三前走ペース偏差値": "three_back_pace_dev",
+    "三前走展開": "three_back_race_shape",
+    "三前走タイム指数": "three_back_time_index",
+    "四前走タイム指数": "four_back_time_index",
+    "五前走タイム指数": "five_back_time_index",
+    "過去5走の最高タイム指数": "best_time_index_last5",
+    "過去5走の最高タイム指数順位": "best_time_index_rank_last5",
+    "最高タイム指数から何戦目": "races_since_best_time_idx",
+    "持ちタイム順位": "personal_best_time_rank",
+    "タイム指数上昇係数": "time_index_gain_coef",
+    "タイム指数回帰推定値": "time_index_reg_est",
+    "タイム指数回帰標準偏差": "time_index_reg_std",
+    "前走休養週数": "last_layoff_weeks",
+    "前走曜日コード": "last_weekday_code",
+    "前走ペース": "last_pace_text",
+    "タイム指数上昇係数A": "time_index_gain_coef_a",
+    "タイム指数回帰推定値A": "time_index_reg_est_a",
+    "タイム指数回帰標準偏差A": "time_index_reg_std_a",
+    "前走タイム指数A": "last_time_index_a",
+    "前々走タイム指数A": "two_back_time_index_a",
+    "過去5走の最高タイム指数A": "best_time_index_last5_a",
+    "前走騎手評価": "last_jockey_rating",
+    "前走人気": "last_popularity",
+    "前走人気着順差": "last_pop_finish_diff",
+    "前走人気A": "last_popularity_a",
+    "前走着差": "last_margin",
+    "前走馬体重": "last_body_weight",
+    "前走中央馬数": "last_race_jra_horses",
+    "前走競馬場ランク差": "last_venue_rank_diff",
+    "前走競馬場地域名": "last_venue_region",
+    "前走レースレベル": "last_race_level", # ← 追加
+    "前走レースレベル順位": "last_race_level_rank", # ← 追加
+    "競走条件クラス": "race_class", #←JRA05で追加
+
+    # --- 関係者情報 (Jockey/Trainer/Owner Info) ---
+    "騎手コード": "jockey_id",
+    "調教師コード": "trainer_id",
+    "調教師東西所属コード": "trainer_region_code",
+    "騎手東西所属コード": "jockey_region_code",
+    "騎手年齢": "jockey_age",
+    "調教師年齢": "trainer_age",
+    "騎手ランキング": "jockey_rank",
+    "調教師ランキング": "trainer_rank",
+    "騎手直近複勝回収率順位": "jockey_recent_place_roi_rank",
+    "騎手直近複勝回収率": "jockey_recent_place_roi",
+    "騎手マスタ_地域コード": "jockey_master_region_code",
+    "調教師マスタ_地域コード": "trainer_master_region_code",
+    "騎手調教師": "jockey_trainer_pair",
+
+    # --- 血統情報 (Pedigree Info) ---
+    "血統総合評価": "bloodline_score",
+    "血統総合評価B": "pedigree_score_b",
+    "血統距離評価": "pedigree_distance_rating",
+    "血統トラック評価": "pedigree_track_rating",
+    "血統成長力評価": "pedigree_growth_rating",
+    "血統距離評価B": "pedigree_distance_rating_b",
+    "血統トラック評価B": "pedigree_track_rating_b",
+    "血統成長力評価B": "pedigree_growth_rating_b",
+    "繁殖馬名1": "bloodline1",
+    "繁殖馬名5": "bloodline5",
+
+    # --- レース・馬の状態/変化 (Status / Change) ---
+    "馬場状態コード": "surface_state_code",
+    "混合": "mix_flag",
+    "クラス変動": "class_change",
+    "見習区分": "apprentice_flag",
+    "テン乗り": "first_time_jockey_flag",
+    "場変更": "venue_change",
+    "トラック変更": "track_change",
+    "前走異常区分コード": "last_anomaly_code",
+    "遠征": "travel_flag",
+    "競馬場地域変化": "venue_region_change",
+    "転厩": "stable_transfer_flag",
+    "競馬場地域変更": "venue_region_changed", # ← 追加
+
+    # --- 差分/比率/統計 (Difference / Ratio / Statistics) ---
+    "人気馬得点差": "fav_score_diff",
+    "予想勝ち指数差": "pred_win_idx_diff",
+    "波乱度": "upset_index",
+    "出走キャリア平均": "field_career_mean",
+    "キャリア差": "career_gap",
+    "斤量比": "weight_ratio",
+    "前走頭数差": "last_field_size_diff",
+    "最高指数差": "best_index_diff",
+    "馬番率": "horse_number_ratio",
+    "予想タイム指数順位率": "pred_time_rank_ratio",
+    "馬券評価順位率": "bet_eval_rank_ratio",
+    "予想人気差": "pred_popularity_diff",
+    "人気馬券差": "popularity_bet_diff",
+    "馬体重順位率": "body_weight_rank_ratio",
+    "前走得点差": "last_score_diff",
+    "騎手評価差": "jockey_rating_diff",
+    "枠順評価差": "draw_rating_diff",
+    "前走場コード差": "last_venue_code_diff",
+    "前々走人気着順差": "two_back_pop_finish_diff",
+    "三前走人気着順差": "three_back_pop_finish_diff",
+    "曜日差": "weekday_diff",
+    "初出走競馬場ランク": "first_race_venue_rank",
+
+    # --- その他 / 不明瞭 (Other / Unclear) ---
+    "1人気馬番差": "fav_horse_rank_gap",
+    "トラック名": "track_name",
+    "曜日コード": "weekday_code",
+    "枠入り順": "stall_entry_order",
+    "枠入り順率": "stall_entry_order_ratio",
+    "予想タイム標準偏差A": "pred_time_std_a",
+    "一番人気予想展開": "fav_pred_pace",
+    "一番人気予想展開差": "fav_pace_gap",
+    "競馬場地域名": "venue_region",
+    "三連単人気順位":   "trifecta_popularity_rank",
+    "所属調教師コード": "trainer_affiliation_code",
+    "馬体重順位":       "body_weight_rank",
+    "馬体重偏差値":     "body_weight_dev",
+    "前走枠順評価":     "last_draw_rating",
+    "天候コード":         "weather_code",
+    "人気馬得点1":      "pop_horse_score1",
+    "人気馬支持率1":    "pop_horse_support_rate1",
+    "人気馬馬券評価順位1": "pop_horse_bet_eval_rank1",
+    "波乱度2":         "upset_index2",
+    "馬体重標準偏差":     "body_weight_std",
+    "一番人気馬番差":     "fav_horse_number_diff",
+    "馬体重区分":       "body_weight_category",
+    "ゾーン":            "zone",
+    "PO馬":             "po_horse_flag",
+    "穴ぐさ":            "anagusa_flag",
+    "芝ダ連対比率":     "turf_dirt_ratio_win_place",
+    "過去人気平均":     "avg_past_popularity",
+    "過去着順平均":     "avg_past_finish_position",
+    "過去人気着順差異":     "past_pop_finish_gap",
+    "ブリンカー":         "blinker_flag",
+    "前走ブリンカー":     "last_blinker_flag",
+    "前走マイニング予想順位": "last_mining_pred_rank",
+    "当日乗替":            "jockey_change_today_flag",
+    "ブリンカー変化":     "blinker_change_flag",
+    "馬名":              "horse_name",
+    "コース区分":       "corse_code",
+    "前走馬体重順位": "prev_body_weight_rank",
+    "前走馬体重偏差値":               "prev_body_weight_stdscore",
+    "前走馬番":                       "prev_horse_number",
+    "前走馬番差":                       "diff_prev_horse_number",
+    "開催日馬番":                       "date_horse_number",
+    "前走開催日馬番":                 "prev_date_horse_number",
+    "前々走開催日馬番":               "prev2_date_horse_number",
+    "騎手直近複勝回収率順位2":     "jockey_recent_place_return_rank2",
+    "前走不利":                       "prev_trouble",
+    "前走騎手評価差異":               "diff_prev_jockey_rating",
+    "馬体重順位差":         "diff_body_weight_rank",
+    "競走条件種別コード":            "race_condition_type_code",
+    "予想展開平均":                   "predicted_race_pace_avg",
+    "予想展開平均差":                 "predicted_race_pace_diff",
+    "予想単勝比率":                   "predicted_win_ratio",
+    "生産者コード":                   "breeder_code",
+    "馬主コード":                     "owner_code",
+    "血統登録番号":                   "bloodline_index",
+    "枠番":                           "wakuban",
+    "馬券外指数":                     "baken_out"
+}
+
+# ── 集約統計量計算の対象とする列 ────────────────
+AGGREGATION_TARGET_COLS = [
+    "pred_time_index", "pred_dash_index", "score", "score_v3", "score_ver3",
+    "pred_odds", "trifecta_support_rate",  "last_time_index",
+    "body_weight","jockey_rating", "trainer_rating","baken_out"
+]
+# ───────────────────────────────────────
+
+# ★【追加】PO馬・穴ぐさエンコード関数
+def encode_marks(lf: pl.LazyFrame) -> pl.LazyFrame:
+    """PO馬・穴ぐさ列を数値エンコードし、欠損を 0 で埋める。"""
+    po_map  = {'0': 0, '☆': 1, '★': 2}
+    ana_map = {'0': 0, 'C': 1, 'B': 2, 'A': 3}
+    if "po_horse_flag" not in lf.columns or "anagusa_flag" not in lf.columns:
+        print("⚠ PO馬または穴ぐさ列が見つからないため、エンコードをスキップします。")
+        return lf
+    return (
+        lf
+        .with_columns([
+            pl.col("po_horse_flag").cast(pl.Utf8, strict=False).str.strip_chars().replace(po_map, default=0).cast(pl.Int8).alias("po_mark_rank"),
+            pl.col("anagusa_flag").cast(pl.Utf8, strict=False).str.strip_chars().replace(ana_map, default=0).cast(pl.Int8).alias("anagusa_rank"),
+        ])
+        .drop(["po_horse_flag", "anagusa_flag"])
+    )
+
+# ── util -----------------------------------------------------------------
+norm = lambda s: _ud.normalize("NFKC", s).strip()
+t0 = time.time()
+log = lambda msg: print(f"▶ {msg:<34} {time.time()-t0:6.1f}s")
+
+# ── ② ヘッダ 0 行読み込み → 正規化 map 生成 ------------------------------
+with open(DATA_CSV, encoding="utf8", newline="") as f:
+    reader = csv.reader(f)
+    header_cols = next(reader)
+norm_map = {c: norm(c) for c in header_cols}
+
+# ── ③ LazyFrame 読み込み & 正規化 rename ---------------------------------
+schema_fix = {"転厩": pl.Utf8, "所属": pl.Utf8, "穴ぐさ": pl.Utf8, "PO馬": pl.Utf8, "競走コード": pl.Utf8, "血統登録番号": pl.Utf8}
+lf = (
+    pl.read_csv(
+        DATA_CSV,
+        encoding="utf8",
+        infer_schema_length=5_000,
+        schema_overrides=schema_fix,
+        low_memory=False,
+    )
+    .lazy()
+    .rename(norm_map)
+)
+log("read_csv → lazy → 正規化 rename")
+
+# ── ④ 日本語→英語リネーム -------------------------------------------------
+present_cols_after_norm = list(lf.schema.keys())
+jp2en_norm = {norm(k): v for k, v in j2e.items()}
+rename_map_jp2en = {jp: en for jp, en in jp2en_norm.items() if jp in present_cols_after_norm}
+lf = lf.rename(rename_map_jp2en)
+log("日本語→英語リネーム")
+
+# ── ④-A 【JRA05修正】date の型変換タイミングを前倒し ---------------------
+if "date" in lf.schema:
+    lf = lf.with_columns(pl.col("date").str.strptime(pl.Datetime, "%Y/%m/%d %H:%M:%S", strict=False))
+    log("date 列を Datetime 化")
+
+# =============================================================================
+# タイトル: race_code を 11桁の文字列へ固定（数値・文字列の両方に安全）
+# 説明:
+#  1) 数値なら Int64 へ丸めてから文字列化（".0" を確実に除去）
+#  2) 文字列なら ".0" を末尾だけ安全に取り除く
+#  3) 非数字は除去 → 11桁ゼロ埋め
+#  4) 妥当性監査（末尾 01..12）
+# =============================================================================
+import re
+_RC_LAST2_RE = r"^\d{9}(0[1-9]|1[0-2])$"
+
+if "race_code" in lf.columns:
+    rc_expr = (
+        pl.when(pl.col("race_code").cast(pl.Int64, strict=False).is_not_null())
+          # 数値→整数→文字列（".0"の影響を完全遮断）
+          .then(pl.col("race_code").cast(pl.Int64, strict=False).cast(pl.Utf8))
+        .when(pl.col("race_code").cast(pl.Float64, strict=False).is_not_null())
+          # 万一 Float のままでも整数化してから文字列化
+          .then(pl.col("race_code").cast(pl.Float64, strict=False).round(0).cast(pl.Int64).cast(pl.Utf8))
+        .otherwise(
+          # すでに文字列なら、末尾の ".0" だけを安全に除去（中間の '.' は残る想定なし）
+          pl.col("race_code").cast(pl.Utf8, strict=False).str.replace(r"\.0$", "")
+        )
+    )
+
+    lf = lf.with_columns(
+        rc_expr
+         .str.replace_all(r"\D", "")  # 念のため非数字は除去
+         .str.zfill(11)               # 11桁に統一（不足分は左ゼロ埋め）
+         .alias("race_code")
+    )
+    log("race_code を 11桁の文字列に固定（数値/文字列どちらも安全）")
+
+    # 妥当性チェック（末尾 01..12）
+    _bad = (
+        lf.filter(~pl.col("race_code").str.contains(_RC_LAST2_RE))
+          .select("date", "race_code", "race_number")
+          .limit(5)
+          .collect()
+    )
+    if _bad.height > 0:
+        print("🚨 [Phase-1] race_code 形式不正（例示5件）:")
+        print(_bad)
+        # 必要なら停止:
+        # raise RuntimeError("race_code の末尾が 01..12 でない行を検出しました。")
+    else:
+        log("race_code 形式チェック（11桁 & 末尾01..12）を通過")
+else:
+    raise RuntimeError("race_code 列が見当たりません。マッピング漏れを確認してください。")
+
+# ── ④-B 馬名を文字数に変換 -------------------------------------------
+log("馬名を文字数特徴量に変換")
+HORSE_NAME_COL = 'horse_name'
+if HORSE_NAME_COL in lf.columns:
+    lf = lf.with_columns(
+        pl.col(HORSE_NAME_COL).str.len_chars().fill_null(0).alias('horse_name_length')
+    ).drop(HORSE_NAME_COL)
+    print(f"  ✅ 特徴量 'horse_name_length' を作成し、'{HORSE_NAME_COL}' を削除しました。")
+else:
+    print(f"  - 警告: 馬名列 '{HORSE_NAME_COL}' が見つからなかったため、文字数への変換をスキップしました。")
+
+# ★【変更】PO馬・穴ぐさ列をエンコード ------------------------
+lf = encode_marks(lf)
+log("PO馬・穴ぐさ列を数値にエンコード")
+
+# ── ⑤-A 【JRA05修正】 年齢グループ特徴量を作成 (2歳馬を追加) ----------------
+log("年齢グループ特徴量を作成")
+if "horse_age" in lf.columns:
+    lf = lf.with_columns(
+        pl.when(pl.col("horse_age") == 2).then(pl.lit("2yo"))
+        .when(pl.col("horse_age") == 3).then(pl.lit("3yo"))
+        .otherwise(pl.lit("older")).alias("age_group")
+    )
+    log("✅ 年齢グループ特徴量 (age_group) を追加完了")
+else:
+    log("⚠ horse_age 列が見つからないため、年齢グループ特徴量の作成をスキップ")
+
+# ── ⑤-B 【JRA05追加】 数値/カテゴリ両用特徴量のカテゴリ版を作成 ──
+log("数値/カテゴリ両用特徴量のカテゴリ版を作成")
+# 対象となる列のリスト
+cols_to_create_cat_version = [
+    # レース関連
+    'venue_code', 'track_surface_code', 'track_code', 'distance',
+    'meeting_order', 'day_order', 'race_type_code', 'race_condition_code',
+    'race_condition_type_code', 'weather_code', 'surface_state_code',
+#    'month','race_number',
+    # 馬・枠関連
+    'sex_code', 'horse_mark_code', 'coat_color_code',
+#    'horse_number', 'wakuban',
+    # 状態変化・フラグ
+    'venue_change', 'track_change', 'class_change', 'mix_flag', 'apprentice_flag',
+    'first_time_jockey_flag', 'travel_flag', 'last_anomaly_code',
+    # 関係者ID
+    'jockey_region_code', 'trainer_region_code','trainer_affiliation_code',
+#    'jockey_id', 'trainer_id', 'owner_code', 'breeder_code',
+    # その他（順位・指数など）
+#    'upset_index', 'upset_index2',
+#    'num_first_runners', 'num_front_runners',
+#    'fav_confidence', 'pred_popularity', 'trifecta_popularity_rank',
+#    'early_speed_rank', 'body_weight_rank', 'last_final_3f_rank',
+#    'pred_dash_rank', 'last_venue_code', 'last_popularity', 'last_finish',
+#    'two_back_popularity', 'two_back_finish', 'three_back_popularity',
+#    'three_back_finish', 'stall_entry_order', 'weight_type_code'
+]
+
+cat_exprs = []
+for col_name in cols_to_create_cat_version:
+    if col_name in lf.columns:
+        cat_exprs.append(pl.col(col_name).cast(pl.Utf8).fill_null("__NA__").alias(f"{col_name}_cat"))
+
+if cat_exprs:
+    lf = lf.with_columns(cat_exprs)
+    log(f"✅ カテゴリ版特徴量 ({len(cat_exprs)}列) を追加完了")
+else:
+    log("⚠ カテゴリ版特徴量の対象列が見つかりませんでした。")
+
+
+# ── ⑤-B+1: 馬券外指数の正規化とスコア化 ─────────────────────────
+log("baken_out -> bgi_norm / bgi_score を追加")
+
+if "baken_out" in lf.columns:
+    # CSV側が 0–5 か 0–100 かを自動判定（>10 を 100スケール扱い）
+    _bgi_max = (
+        lf.select(pl.col("baken_out").cast(pl.Float64).max().alias("_bmax"))
+          .collect(streaming=True)["_bmax"][0]
+    )
+    _scale = 100.0 if (_bgi_max is not None and _bgi_max > 10) else 5.0
+
+    lf = lf.with_columns([
+        (pl.col("baken_out").cast(pl.Float32) / pl.lit(_scale))
+            .clip(0.0, 1.0).alias("bgi_norm"),
+        (pl.col("baken_out").cast(pl.Float32) * (100.0 / _scale))
+            .alias("bgi_score"),
+    ])
+    # 後段⑥-D（集約統計量）で平均/分散などを作るため、集約対象に加える
+    if "bgi_norm" not in AGGREGATION_TARGET_COLS:
+        AGGREGATION_TARGET_COLS.append("bgi_norm")
+
+    log(f"✅ bgi_norm/bgi_score 追加（scale={_scale}）")
+else:
+    log("⚠ baken_out 列が無いため BGI 追加をスキップ")
+
+
+
+# ── ⑥ 欠損値の処理 (フラグ生成) ──────────────────
+log("特定系統の欠損フラグ列の作成を開始")
+
+# 対象とする文字列のリスト
+target_keywords = ["time_index", "race_shape", "popularity", "pace_dev", "last"]
+
+# 対象となる列を特定
+cols_for_missing_flag = []
+current_columns = lf.columns
+for col in current_columns:
+    dtype = lf.schema[col]
+    if dtype in pl.NUMERIC_DTYPES: # 数値型のみを対象
+        if any(keyword in col for keyword in target_keywords):
+            cols_for_missing_flag.append(col)
+
+# 重複を削除
+cols_for_missing_flag = sorted(list(set(cols_for_missing_flag)))
+
+missing_flag_exprs = [pl.col(c).is_null().cast(pl.Int8).alias(f"{c}_is_missing") for c in cols_for_missing_flag]
+
+if missing_flag_exprs:
+    lf = lf.with_columns(missing_flag_exprs)
+    log(f"特定系統の欠損フラグ列 ({len(cols_for_missing_flag)}列) を追加完了")
+else:
+    log("欠損フラグ作成の対象列が見つかりませんでした。")
+
+# ── ⑥-B 【JRA05追加】 ビン化特徴量の作成 ──────────────────
+log("ビン化特徴量の作成を開始")
+binning_exprs = []
+# distance_change のビン化
+if "distance_change" in lf.columns:
+    binning_exprs.append(
+        pl.when(pl.col("distance_change") == 0).then(pl.lit(0, dtype=pl.Int8))
+        .when(pl.col("distance_change").abs() <= 400).then(2 * pl.col("distance_change").sign())
+        .otherwise(3 * pl.col("distance_change").sign())
+        .cast(pl.Int8)
+        .alias("distance_change_bin")
+    )
+# score のビン化
+if "score" in lf.columns:
+    binning_exprs.append(
+        pl.when(pl.col("score") <= 30).then(pl.lit(0, dtype=pl.Int8))
+        .when(pl.col("score") <= 40).then(pl.lit(1, dtype=pl.Int8))
+        .when(pl.col("score") <= 50).then(pl.lit(2, dtype=pl.Int8))
+        .when(pl.col("score") <= 54).then(pl.lit(3, dtype=pl.Int8))
+        .when(pl.col("score") <= 57).then(pl.lit(4, dtype=pl.Int8))
+        .otherwise(pl.lit(5, dtype=pl.Int8))
+        .alias("score_bin")
+    )
+
+if binning_exprs:
+    lf = lf.with_columns(binning_exprs)
+    log(f"✅ ビン化特徴量 ({len(binning_exprs)}列) を追加完了")
+
+
+
+# ── ⑥-D レース内集約統計量 ──────────────────
+log("レース内集約統計量の計算を開始")
+race_keys = ["date", "race_code", "race_number"]  # レース識別キー
+schema_after_drop = lf.schema
+schema_names        = list(schema_after_drop.keys())
+effective_agg_cols = [c for c in AGGREGATION_TARGET_COLS if c in schema_names and schema_after_drop[c] in pl.NUMERIC_DTYPES]
+if not effective_agg_cols:
+    log("レース内集約統計量を計算する有効な列がありません")
+else:
+    agg_expressions = []
+    for col in effective_agg_cols:
+        agg_expressions += [
+            pl.col(col).sum().alias(f"{col}_race_sum"),
+            pl.col(col).mean().alias(f"{col}_race_mean"),
+            pl.col(col).var().alias(f"{col}_race_var"),
+            pl.col(col).std().alias(f"{col}_race_std"),
+            pl.col(col).max().alias(f"{col}_race_max"),
+            pl.col(col).min().alias(f"{col}_race_min"),
+            (pl.col(col).max() - pl.col(col).min()).alias(f"{col}_race_range"),
+            pl.col(col).skew().fill_nan(None).alias(f"{col}_race_skew"),
+            pl.col(col).kurtosis().fill_nan(None).alias(f"{col}_race_kurt"),
+        ]
+    cols_to_collect_for_agg = race_keys + effective_agg_cols
+    df_tmp_agg = lf.select(cols_to_collect_for_agg).collect(streaming=True)
+    stats_df = df_tmp_agg.group_by(race_keys, maintain_order=True).agg(agg_expressions)
+    log(f"レースごとの統計量を計算 ({len(effective_agg_cols)}列から)")
+    lf = lf.join(stats_df.lazy(), on=race_keys, how="left", coalesce=True)
+    log(f"レース内集約統計量列 ({len(effective_agg_cols)*9}列) を追加")
+
+# ── ⑥-E 【JRA05追加】レース内相対特徴量の汎用ブロック ──────────────────
+log("レース内相対特徴量の汎用ブロックを開始")
+RELATIVE_TARGET_COLS = [
+    "pred_time_index", "pred_dash_index", "score", "pred_odds", "trifecta_support_rate",
+    "weight_carried", "last_time_index", "two_back_time_index", "three_back_time_index",
+    "last_pace_dev", "body_weight", "place_rate", "last_race_level", "weight_ratio",
+    "jockey_rating", "trainer_rating",
+    "bgi_norm",  # ← 追加（大きいほど“馬券外寄り”）
+]
+RANK_DESC_MAP = {  # True=降順（大きいほど良い）
+    "pred_time_index": True, "pred_dash_index": True, "score": True,
+    "trifecta_support_rate": True, "last_time_index": True, "two_back_time_index": True,
+    "three_back_time_index": True, "body_weight": True, "place_rate": True,
+    "last_race_level": True, "jockey_rating": True, "trainer_rating": True,
+    "pred_odds": False, "weight_carried": False, "last_pace_dev": False, "weight_ratio": False,
+    "bgi_norm": True,  # ← 高いほど悪い＝降順で上位（=危険度が高い）
+}
+
+# --- ステップ1: rank 列を先に作成 ---
+rank_exprs = []
+for col in RELATIVE_TARGET_COLS:
+    if col in lf.columns:
+        rank_col_name = f"{col}_rank_in_race"
+        rank_exprs.append(
+            pl.col(col).rank(method="average", descending=RANK_DESC_MAP.get(col, True)).over(race_keys)
+              .alias(rank_col_name)
+        )
+if rank_exprs:
+    lf = lf.with_columns(rank_exprs)
+
+# --- ステップ2: rank列や集約統計量を使って他の相対特徴量を作成 ---
+other_relative_exprs = []
+eps = 1e-6
+for col in RELATIVE_TARGET_COLS:
+    if col in lf.columns:
+        rank_col_name = f"{col}_rank_in_race"
+        mean_col = f"{col}_race_mean"
+        std_col  = f"{col}_race_std"
+        min_col = f"{col}_race_min"
+        max_col = f"{col}_race_max"
+        is_desc = RANK_DESC_MAP.get(col, True)
+
+        # rank_ratio, is_top1, is_top3
+        if rank_col_name in lf.columns:
+            other_relative_exprs.append(
+                ((pl.col(rank_col_name) - 1) / (pl.len().over(race_keys) - 1).clip(lower_bound=1))
+                  .clip(0.0, 1.0).fill_nan(0.0).alias(f"{col}_rank_ratio")
+            )
+            other_relative_exprs.append((pl.col(rank_col_name) == 1).cast(pl.Int8).alias(f"{col}_is_top1"))
+            other_relative_exprs.append((pl.col(rank_col_name) <= 3).cast(pl.Int8).alias(f"{col}_is_top3"))
+
+        # diff_from_mean / z_in_race
+        if mean_col in lf.columns:
+            other_relative_exprs.append( (pl.col(col) - pl.col(mean_col)).alias(f"{col}_diff_from_mean") )
+            if std_col in lf.columns:
+                other_relative_exprs.append( ((pl.col(col) - pl.col(mean_col)) / (pl.col(std_col) + eps))
+                                .alias(f"{col}_z_in_race") )
+        # diff_to_top / share_of_top (向きを考慮)
+        if max_col in lf.columns and min_col in lf.columns:
+            other_relative_exprs.append(
+                pl.when(is_desc)
+                  .then(pl.col(max_col) - pl.col(col))
+                  .otherwise(pl.col(col) - pl.col(min_col))
+                  .alias(f"{col}_diff_to_top")
+            )
+            other_relative_exprs.append(
+                pl.when(is_desc)
+                  .then(pl.col(col) / (pl.col(max_col) + eps))
+                  .otherwise((pl.col(min_col) + eps) / (pl.col(col) + eps))
+                  .alias(f"{col}_share_of_top")
+            )
+
+if other_relative_exprs:
+    lf = lf.with_columns(other_relative_exprs)
+
+log(f"レース内相対特徴量を {len(RELATIVE_TARGET_COLS)} 種に付与完了")
+
+
+# ── ⑥-E+α: bgi のメディアン乖離（レース内中央値との差）だけ個別追加
+if "bgi_norm" in lf.columns:
+    rk = ["date", "race_code", "race_number"]
+    lf = lf.with_columns(
+        (pl.col("bgi_norm") - pl.col("bgi_norm").median().over(rk)).alias("bgi_gap_med")
+    )
+    log("bgi_gap_med を追加（bgi_norm − median_in_race）")
+
+
+
+# ── ⑥-G 【JRA05追加】トップ独走度のレース定数 ──────────────────
+log("トップ独走度のレース定数を作成")
+top_margin_cols = ["trifecta_support_rate", "pred_odds","pred_time_index","pred_dash_index","score","score_ver3"]
+top_margin_exprs = []
+for col in top_margin_cols:
+    if col in lf.columns:
+        is_desc = RANK_DESC_MAP.get(col, True)
+        top_val = pl.col(col).sort(descending=is_desc).first().over(race_keys)
+        second_val = pl.col(col).sort(descending=is_desc).slice(1, 1).first().over(race_keys)
+        margin_expr = (top_val - second_val).abs().alias(f"{col}_top_margin_in_race")
+        top_margin_exprs.append(margin_expr)
+        top_margin_exprs.append((margin_expr / (top_val.abs() + eps)).alias(f"{col}_top_margin_norm_in_race"))
+
+if top_margin_exprs:
+    lf = lf.with_columns(top_margin_exprs)
+    log(f"✅ トップ独走度特徴量 ({len(top_margin_exprs)}列) を追加完了")
+
+# ── ⑦-B 【追加】 円環特徴量 ------------------------------------------------
+lf = lf.with_columns([
+    (pl.col("date").dt.month()  / 12 * 2 * math.pi).sin().alias("month_sin"),
+    (pl.col("date").dt.month()  / 12 * 2 * math.pi).cos().alias("month_cos"),
+    (pl.col("date").dt.weekday() / 7 * 2 * math.pi).sin().alias("wday_sin"),
+    (pl.col("date").dt.weekday() / 7 * 2 * math.pi).cos().alias("wday_cos"),
+    (pl.col("date").dt.week()      / 52 * 2 * math.pi).sin().alias("week_sin"),
+    (pl.col("date").dt.week()      / 52 * 2 * math.pi).cos().alias("week_cos"),
+])
+log("円環特徴量 (month, wday, week) を追加")
+
+# ── ⑦-B-2 【JRA05追加】 季節特徴量 ------------------------------------------------
+log("季節特徴量を追加")
+if "month" in lf.columns:
+    lf = lf.with_columns(
+        pl.when(pl.col("month").is_in([3, 4, 5])).then(pl.lit("Spring"))
+        .when(pl.col("month").is_in([6, 7, 8])).then(pl.lit("Summer"))
+        .when(pl.col("month").is_in([9, 10, 11])).then(pl.lit("Autumn"))
+        .otherwise(pl.lit("Winter"))
+        .alias("season")
+    )
+    log("✅ 季節特徴量 (season) を追加完了")
+else:
+    log("⚠ month 列が見つからないため、季節特徴量の作成をスキップ")
+
+# ── ★★★ ⑦-C【JRA05修正】距離ビンの多層化 & venue_code との交互作用 ──
+log("距離ビンの多層化とvenue交互作用を作成")
+# --- 距離ビンを先に作る ---
+if "distance" in lf.columns:
+    lf = lf.with_columns([
+#        (((pl.col("distance") + 100) // 200) * 200).cast(pl.Int32).alias("distance_bin_200"),
+        (((pl.col("distance") + 200) // 400) * 400).cast(pl.Int32).alias("distance_bin_400"),
+#        ((pl.col("distance") // 1000) * 1000).cast(pl.Int32).alias("distance_family_1000"),
+        pl.when(pl.col("distance") < 1400).then(pl.lit("spr"))
+         .when(pl.col("distance") <= 1899).then(pl.lit("mile"))
+         .when(pl.col("distance") <= 2399).then(pl.lit("inter"))
+         .otherwise(pl.lit("stayer")).alias("distance_band4"),
+        #【JRA05追加】距離の連続性を強化
+        (pl.col("distance").cast(pl.Float64)).alias("dist_f"),
+    ])
+    lf = lf.with_columns([
+        (pl.col("dist_f")/1000.0).alias("dist_km"),
+        (pl.col("dist_f")**2).alias("dist_sq"),
+        (pl.col("dist_f")**3).alias("dist_cu"),
+    ])
+    # --- 距離ビンを使ってさらに特徴量を作成 ---
+    if "distance_band4" in lf.columns and "track_surface_code" in lf.columns:
+        lf = lf.with_columns(
+            (pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__") + pl.lit("_") + pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")).alias("surface_distance_band4")
+        )
+
+# --- その後に venue との交互作用を作る ---
+interaction_exprs = []
+if "venue_code" in lf.schema:
+    # 既存の交互作用
+    interaction_exprs.append(pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__").alias("venue_code_str"))
+    if "track_surface_code" in lf.schema:
+        interaction_exprs.append(
+            pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_surface_combo")
+        )
+        # 3要素の交互作用を追加
+        if "distance_band4" in lf.schema:
+            interaction_exprs.append(
+                pl.concat_str([
+                    pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"),
+                    pl.col("track_surface_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"),
+                    pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")
+                ]).alias("venue_surface_distance_band_combo")
+            )
+    if "track_code" in lf.schema:
+        interaction_exprs.append(
+            pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("track_code").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_track_combo")
+        )
+    # 距離ビンとの交互作用（拡張版）
+#    if "distance_bin_200" in lf.schema:
+#        interaction_exprs.append(
+#            pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("distance_bin_200").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_distance_bin")
+#        )
+#    if "distance_bin_400" in lf.schema:
+#        interaction_exprs.append(
+#            pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("distance_bin_400").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_distance400_bin")
+#        )
+    if "distance_band4" in lf.schema:
+        interaction_exprs.append(
+            pl.concat_str([pl.col("venue_code").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("distance_band4").cast(pl.Utf8).fill_null("__NA__")]).alias("venue_distance_band4")
+        )
+
+if interaction_exprs:
+    lf = lf.with_columns(interaction_exprs)
+    log("venue_code 交互作用（拡張版）を追加")
+
+    lf = lf.collect(streaming=True).lazy()
+    log("materialize barrier：venue交互作用列を確定（collect→lazy）")
+else:
+    log("⚠ venue_code 交互作用の作成をスキップ（必要列が不足）")
+
+# ── ⑦-C-2 【JRA05追加】 関係者の組み合わせ特徴量 ----------------------------------
+log("関係者の組み合わせ特徴量を作成")
+combo_exprs = []
+required_cols_for_combo = ["jockey_id", "trainer_id", "owner_code"]
+if all(c in lf.columns for c in required_cols_for_combo):
+    combo_exprs.extend([
+#        pl.concat_str([pl.col("jockey_id").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("trainer_id").cast(pl.Utf8).fill_null("__NA__")]).alias("jockey_trainer_combo"),
+        pl.concat_str([pl.col("jockey_id").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("owner_code").cast(pl.Utf8).fill_null("__NA__")]).alias("jockey_owner_combo"),
+#        pl.concat_str([pl.col("trainer_id").cast(pl.Utf8).fill_null("__NA__"), pl.lit("_"), pl.col("owner_code").cast(pl.Utf8).fill_null("__NA__")]).alias("trainer_owner_combo"),
+    ])
+    lf = lf.with_columns(combo_exprs)
+    log("✅ 騎手・調教師・馬主の組み合わせ特徴量 (3列) を追加完了")
+else:
+    log("⚠ 組み合わせ特徴量に必要な列 (jockey_id, trainer_id, owner_code) が不足しているためスキップ")
+
+
+
+# ── ⑦-D 【追加】日単位・レース単位の頻度特徴量 ──────────────────
+log("日単位・レース単位の頻度特徴量を追加")
+# 安定化のため、主要なものに絞る
+STABLE_FREQ_COLS = [
+#    "venue_surface_distance_band_combo",
+    "jockey_trainer_combo",
+    "jockey_owner_combo", "trainer_owner_combo",
+]
+
+freq_exprs = []
+if "date" in lf.schema and isinstance(lf.schema["date"], pl.datatypes.Datetime):
+    # 元々の頻度特徴量
+    for id_col in ["jockey_id", "trainer_id", "owner_code", "breeder_code"]:
+         if id_col in lf.columns:
+            freq_exprs.append(pl.col(id_col).count().over([pl.col("date").dt.date(), id_col]).alias(f"{id_col}_day_freq"))
+            freq_exprs.append(pl.col(id_col).count().over(["race_code", id_col]).alias(f"{id_col}_race_freq"))
+    # 相互作用の出現量
+    # for id_col in STABLE_FREQ_COLS:
+    #     if id_col in lf.columns:
+    #         freq_exprs.append(pl.col(id_col).count().over([pl.col("date").dt.date(), id_col]).alias(f"{id_col}_day_freq"))
+
+    if freq_exprs:
+        lf = lf.with_columns(freq_exprs)
+        log(f"頻度特徴量 ({len(freq_exprs)}列) を追加完了")
+    else:
+        log("頻度特徴量の対象列が見つかりませんでした。")
+else:
+    log("⚠ date列がDatetime型でないため、日単位の頻度特徴量の作成をスキップします。")
+
+# ── ⑦-E 【JRA05追加】過去走カラムからの行内派生特徴量 ──────────────────
+log("過去走カラムから作る行内派生特徴量を追加")
+# 対象カラム定義
+FIN_COLS  = ["last_finish", "two_back_finish", "three_back_finish"]
+TI3_COLS  = ["last_time_index", "two_back_time_index", "three_back_time_index"]
+TI5_COLS  = TI3_COLS + ["four_back_time_index", "five_back_time_index"]
+PACE_COLS = ["last_pace_dev", "two_back_pace_dev", "three_back_pace_dev"]
+#SHAPE_COLS= ["last_race_shape", "two_back_race_shape", "three_back_race_shape"]
+POP_COLS  = ["last_popularity", "two_back_popularity", "three_back_popularity"]
+PFD_COLS  = ["last_pop_finish_diff", "two_back_pop_finish_diff", "three_back_pop_finish_diff"]
+
+def _present(cols: list[str], frame) -> list[str]:
+    return [c for c in cols if c in frame.columns]
+
+past_race_exprs = []
+# --- 着順系 ---
+fin_av = _present(FIN_COLS, lf)
+if fin_av:
+    past_race_exprs.extend([
+        pl.min_horizontal([pl.col(c) for c in fin_av]).alias("best_finish_last3"),
+        pl.mean_horizontal([pl.col(c) for c in fin_av]).alias("avg_finish_last3"),
+        pl.concat_list([pl.col(c) for c in fin_av]).list.eval(pl.element().std()).list.get(0).alias("std_finish_last3"),
+        pl.concat_list([pl.col(c) for c in fin_av]).list.eval(pl.element().var()).list.get(0).alias("var_finish_last3"),
+    ])
+    if "last_finish" in fin_av and "two_back_finish" in fin_av:
+        past_race_exprs.append((pl.col("two_back_finish") - pl.col("last_finish")).alias("finish_improve_L1_vs_L2"))
+
+# --- タイム指数系 ---
+ti5_av = _present(TI5_COLS, lf)
+if ti5_av:
+    past_race_exprs.extend([
+        pl.max_horizontal([pl.col(c) for c in ti5_av]).alias("max_time_index_last5"),
+        pl.mean_horizontal([pl.col(c) for c in ti5_av]).alias("mean_time_index_last5"),
+        pl.concat_list([pl.col(c) for c in ti5_av]).list.eval(pl.element().std()).list.get(0).alias("std_time_index_last5"),
+        pl.concat_list([pl.col(c) for c in ti5_av]).list.eval(pl.element().var()).list.get(0).alias("var_time_index_last5"),
+    ])
+ti3_av = _present(TI3_COLS, lf)
+if "last_time_index" in ti3_av and "two_back_time_index" in ti3_av:
+    past_race_exprs.append((pl.col("last_time_index") - pl.col("two_back_time_index")).alias("ti_trend_L1_minus_L2"))
+
+# --- 人気系 ---
+pop_av = _present(POP_COLS, lf)
+if pop_av:
+    past_race_exprs.extend([
+        pl.min_horizontal([pl.col(c) for c in pop_av]).alias("best_popularity_last3"),
+        pl.mean_horizontal([pl.col(c) for c in pop_av]).alias("avg_popularity_last3"),
+        pl.concat_list([pl.col(c) for c in pop_av]).list.eval(pl.element().std()).list.get(0).alias("std_popularity_last3"),
+        pl.concat_list([pl.col(c) for c in pop_av]).list.eval(pl.element().var()).list.get(0).alias("var_popularity_last3"),
+    ])
+    if "last_popularity" in pop_av and "two_back_popularity" in pop_av:
+        past_race_exprs.append((pl.col("two_back_popularity") - pl.col("last_popularity")).alias("pop_improve_L1_vs_L2"))
+
+if past_race_exprs:
+    lf = lf.with_columns(past_race_exprs)
+    log(f"✅ 過去走派生特徴量 ({len(past_race_exprs)}列) を追加完了")
+
+# ── ⑨ 日本語列残存チェック ----------------------------------------------
+from polars.datatypes import List as ListDtype
+list_cols = [name for name, dtype in lf.schema.items() if isinstance(dtype, ListDtype)]
+if list_cols:
+    print("⚠️  List 型（可変長）のまま残っている列:", list_cols)
+    lf = lf.drop(list_cols)
+
+remain = [c for c in lf.schema if not re.fullmatch(r"[A-Za-z0-9_]+", c)]
+if remain:
+    raise RuntimeError(f"未英語化列あり → {remain}")
+
+# ── ⑩ Parquet 書き出し ---------------------------------------------------
+# =============================================================================
+# タイトル: Parquet 書き出し直前の dtype 最終固定（race_code は Utf8）
+# 説明: 物理スキーマを string/large_string に固定させるため、collect 直前に再キャスト。
+# =============================================================================
+if "race_code" in lf.columns:
+    lf = lf.with_columns(pl.col("race_code").cast(pl.Utf8))
+
+df_out = lf.collect(streaming=True)
+log("最終 collect 完了")
+import pyarrow as pa
+import pyarrow.parquet as pq
+table = pa.Table.from_batches(df_out.to_arrow().to_batches())
+pq.write_table(table, BASE_PARQUET, compression="zstd")
+log("PyArrow 経由で Parquet write 完了")
+print(f"✅ rows={df_out.height:,} | cols={len(df_out.columns)} → {BASE_PARQUET}")
+
+# ── ⑪ マッピング辞書保存 --------------------------------------------------
+Path(J2E_JSON).parent.mkdir(parents=True, exist_ok=True)
+with open(J2E_JSON, "w", encoding="utf8") as f:
+    json.dump(j2e, f, ensure_ascii=False, indent=2)
+print(f"✅ j2e.json 保存 → {J2E_JSON}")
+
+# ── ⑫ 【JRA05追加】監査メタデータ出力 -------------------------------------
+log("監査メタデータを作成・保存")
+Path(AUDIT_META_CSV).parent.mkdir(parents=True, exist_ok=True)
+meta_data = []
+for col_name in df_out.columns:
+    col_series = df_out[col_name]
+    meta_data.append({
+        "column_name": col_name,
+        "dtype": str(col_series.dtype),
+        "n_unique": col_series.n_unique(),
+        "null_count": col_series.null_count(),
+        "null_ratio": col_series.null_count() / len(df_out) if len(df_out) > 0 else 0,
+    })
+meta_df = pl.DataFrame(meta_data)
+meta_df.write_csv(AUDIT_META_CSV)
+log(f"✅ 監査メタデータを保存 → {AUDIT_META_CSV}")
+
