@@ -1,8 +1,8 @@
 # =============================================================
-# Stage-C（JRA06専用）単勝配当予測モデル｜フルコード v2（最小修正版）
+# Stage-C（JRA06専用）単勝的中率モデル｜フルコード v2（最小修正版）
 #  - 修正点:
 #     1) scale_pos_weight 影響コードを完全削除
-#     2) implied_win_odds / implied_place_odds / zone をdrop（FEATURESにも入らない）
+#     2) implied_win_odds / implied_place_odds / zone を物理drop（FEATURESにも入らない）
 #     3) 予測は raw ロジットをレース内 softmax で正規化（Train/Valid/Test 全て）
 # =============================================================
 
@@ -25,17 +25,13 @@ BET_UNIT = 100
 # マージキー（FULLキー）
 MERGE_KEYS = ["date", "race_code", "horse_number"]
 
-# JRA06 パス定義（JRA05 禁止）
+# JRA06 パス定義
 BASE_PARQUET = "/content/drive/My Drive/Colab/gpt/JRA06/JRA_base_data_2016.parquet"
 SP_DERIVED   = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_time_index_S/JRA_derived_features_from_sp_model.parquet"
 A_DERIVED    = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_a/JRA_derived_features_from_stage_a.parquet"
 B_OOF        = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_b/JRA_stage_b_oof_predictions.parquet"
 B_PRED       = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_b/JRA_stage_b_predictions.parquet"
 ART_DIR_C    = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c"
-CAND_DERIVED = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_cand/JRA_derived_features_from_stage_cand.parquet"
-
-STAGE_C_MODEL_PATH = os.path.join(ART_DIR_C, "JRA_stage_c_model.pkl")  # ← 追加
-
 pathlib.Path(ART_DIR_C).mkdir(parents=True, exist_ok=True)
 
 # カバレッジしきい値（未満なら停止）
@@ -149,63 +145,6 @@ try:
 except FileNotFoundError:
     raise RuntimeError(f"Stage-A ファイルが見つかりません: {A_DERIVED}")
 
-
-# --- Stage-CAND（候補特徴群）---
-cov_cand_any = 0.0
-CAND_COLS_MERGED = []
-try:
-    cand = pd.read_parquet(CAND_DERIVED, engine="pyarrow")
-    cand = _unify_keys(cand)
-
-    # 1) 明確なリーク/不整合列を物理除外（存在しても学習に渡さない）
-    #   - payout/finish/target系、学習時に不要な重み/フラグなどは落とす
-    drop_exact = {
-        "win_payout","place_payout","finishing_position",
-        "target","target_raw","target_capped",
-        "sample_weight_cand","exclude_flag_095","bottom3_by_cand",
-        "time_index"  # 本パイプラインでは未使用
-    }
-    drop_regex = (r"^target_.*", r".*_payout$", r"^y_.*", r".*_label$")
-
-    to_drop = set()
-    for c in cand.columns:
-        if c in MERGE_KEYS:
-            continue
-        if c in drop_exact:
-            to_drop.add(c); continue
-        if any(re.match(patt, c) for patt in drop_regex):
-            to_drop.add(c)
-    if to_drop:
-        cand.drop(columns=list(to_drop), inplace=True, errors="ignore")
-
-    # 2) 既に base にある列名との衝突は除外（キー以外は上書きしない方針）
-    dup_cols = [c for c in cand.columns if (c in base.columns and c not in MERGE_KEYS)]
-    if dup_cols:
-        print(f"   - [INFO] Stage-CAND 既存列と重複のため除外: {dup_cols[:8]}{' ...' if len(dup_cols)>8 else ''}")
-        cand.drop(columns=dup_cols, inplace=True, errors="ignore")
-
-    # 3) マージキー重複チェック
-    if cand.duplicated(MERGE_KEYS).any():
-        dup = int(cand.duplicated(MERGE_KEYS).sum())
-        raise RuntimeError(f"Stage-CANDのマージキーに重複があります（{dup}件）。上流を修正してください。")
-
-    # 4) LEFT JOIN
-    before = len(base)
-    base = base.merge(cand, on=MERGE_KEYS, how="left")
-    CAND_COLS_MERGED = [c for c in cand.columns if c not in MERGE_KEYS]
-    print(f"[MERGE] Stage-CAND を LEFT JOIN します…\n   - 行数: after={len(base):,} (LEFT)")
-
-    # 5) カバレッジ（any非欠損）を参考表示
-    if CAND_COLS_MERGED:
-        _nn = base[CAND_COLS_MERGED].notna().any(axis=1)
-        cov_cand_any = float(_nn.mean())
-        print(f"   - Stage-CAND 非欠損率(any): {cov_cand_any*100:.1f}%")
-
-except FileNotFoundError:
-    print(f"   - [WARN] Stage-CAND ファイルが見つかりません: {CAND_DERIVED}")
-
-
-
 # --- Stage-B OOF（stage-b2 相当）---
 try:
     b_oof = pd.read_parquet(B_OOF, engine="pyarrow")
@@ -253,19 +192,10 @@ probe = {
     "SP:pred_time_index_sp": base["pred_time_index_sp"].notna().mean() if "pred_time_index_sp" in base.columns else 0.0,
     "A:pred_prob_stage_a":    base["pred_prob_stage_a"].notna().mean() if "pred_prob_stage_a" in base.columns else 0.0,
     "B:any":                   base["pred_ev_stage_b_any"].notna().mean() if "pred_ev_stage_b_any" in base.columns else 0.0,
-    "CAND:any":                cov_cand_any  # ← これを追加
 }
 print("\n[INFO] 'pred_ev_stage_b_any' を作成（OOF優先→pred）")
 for k,v in probe.items():
     print(f"   - {k} 非欠損率: {v*100:.1f}%")
-
-# --- PATCH A: Stage-Bの入力列をANYに完全統一（恒久対応） ---
-B_DUP_COLS = ["pred_ev_stage_b_oof", "pred_ev_stage_b_pred"]
-_drop_exists = [c for c in B_DUP_COLS if c in base.columns]
-if _drop_exists:
-    base.drop(columns=_drop_exists, inplace=True, errors="ignore")
-    print(f"   - [CLEANUP] 学習契約を pred_ev_stage_b_any に統一するため、{_drop_exists} を削除しました。")
-
 
 # 厳格停止条件
 if probe.get("SP:pred_time_index_sp",0) < COV_MIN_SP:
@@ -294,7 +224,7 @@ TRAIN_START_DATE = pd.to_datetime("2016-01-01")
 VALID_START_DATE = pd.to_datetime("2023-04-01")
 VALID_END_DATE   = pd.to_datetime("2024-03-31")
 TEST_START_DATE  = pd.to_datetime("2024-04-01")
-TEST_END_DATE    = pd.to_datetime("2025-08-31")
+TEST_END_DATE    = pd.to_datetime("2025-07-31")
 TRAIN_END_DATE   = VALID_START_DATE - pd.Timedelta(days=1)
 
 train = base_sorted[(base_sorted["date"] >= TRAIN_START_DATE) & (base_sorted["date"] <= TRAIN_END_DATE)].copy()
@@ -320,38 +250,6 @@ for name, df_ in (("Train", train), ("Valid", valid), ("Test", test)):
 # --------------------------------------------------
 # Cell-4: 目的変数（単勝） & 前処理
 # --------------------------------------------------
-
-NA_TOKEN = "__NA__"
-RARE_TOKEN = "___RARE___"
-
-def _norm_code_str(s: pd.Series) -> pd.Series:
-    s = s.astype("string").str.strip()
-    s = s.mask(s.str.len().fillna(0) == 0, NA_TOKEN)
-    s = s.mask(s.str.lower().isin({"nan","none"}), NA_TOKEN)
-    s = s.mask(s.isin({"0","0.0"}), NA_TOKEN)  # ← 初戦(0/0.0)を __NA__ へ
-    return s
-
-def _build_cats_with_rare_from_train(s_train: pd.Series, *, min_count=10, min_frac=0.0005, always_allow=None):
-    s_tr = _norm_code_str(s_train)
-    vc = s_tr.value_counts(dropna=False)
-
-    thr = max(min_count, int(np.ceil(min_frac * max(1, len(s_tr)))))
-    keep = set(vc[vc >= thr].index.tolist())
-    if always_allow:
-        keep |= {str(x) for x in always_allow}
-
-    # 予約トークン整理
-    keep.discard(RARE_TOKEN); keep.add(NA_TOKEN)
-    cats = sorted(keep | {RARE_TOKEN})
-    return cats, keep  # cats=最終categories, keep=RAREに畳まない集合(NA含む)
-
-def _apply_categorical_with_rare(dfs, col, cats, keep):
-    for df in dfs:
-        s = _norm_code_str(df[col])
-        s = s.where(s.isin(keep), RARE_TOKEN)
-        df[col] = pd.Categorical(s, categories=cats)
-
-
 print("\n--- Cell-4: 目的変数 & 前処理 ---")
 
 # 目的変数（単勝的中=1）
@@ -367,39 +265,11 @@ cat_cols = [
           # ← zone は含めない
     ] if c in df_all_for_guard.columns
 ]
-
-# レア統合ポリシー
-RARE_WHITELIST = {"last_venue_code"}  # ← 必ず畳み込み対象
-RARE_MIN_COUNT = 10
-RARE_MIN_FRAC  = 0.0005
-
 for c in cat_cols:
-    if c not in df_all_for_guard.columns:
-        continue
-    if str(train[c].dtype) not in ("category","object","string"):
-        # 数値でも“コード”列はまず文字へ
-        train[c] = train[c].astype("string")
-        valid[c] = valid[c].astype("string")
-        test[c]  = test[c].astype("string")
-
-    # 列の固有数に応じて自動判定：多値(>30) or 明示ホワイトリストなら RARE 統合
-    nuniq = _norm_code_str(train[c]).nunique(dropna=False)
-    allow_rare = (c in RARE_WHITELIST) or (nuniq > 30)
-
-    if allow_rare:
-        cats, keep = _build_cats_with_rare_from_train(
-            train[c], min_count=RARE_MIN_COUNT, min_frac=RARE_MIN_FRAC
-        )
-        _apply_categorical_with_rare([train, valid, test], c, cats, keep)
-    else:
-        # 小カーデ列は全値を保持（ただし NA/0→__NA__ は統一）
-        s_tr = _norm_code_str(train[c])
-        cats = sorted(set(s_tr.unique().tolist()) | {NA_TOKEN})  # RARE は敢えて入れない
-        for df_ in (train, valid, test):
-            s = _norm_code_str(df_[c])
-            s = s.where(s.isin(cats), NA_TOKEN)  # 未知は欠損扱い
-            df_[c] = pd.Categorical(s, categories=cats)
-
+    for _df in (train, valid, test):
+        if _df[c].dtype.name == "category":
+            continue
+        _df[c] = _df[c].astype("string").fillna("__NA__").astype("category")
 
 # 0/1 フラグ整形（object→0/1）
 flag_cols = [c for c in ["stable_transfer_flag"] if c in df_all_for_guard.columns]
@@ -476,8 +346,7 @@ race_feats_src = [
     #"diff_to_top_pred_time_index_sp",
     # Stage-A / B
     "pred_prob_stage_a",
-    #"sp_gap","sp_percentile","sp_rank_in_race",
-    "pred_ev_stage_b_any"  # ← ここに追加
+    #"sp_gap","sp_percentile","sp_rank_in_race","pred_ev_stage_b_any"
 ]
 
 
@@ -530,6 +399,28 @@ else:
     print("   - [NOTE] r_* が見つからなかったため、総合順位特徴はスキップしました。")
 
 
+
+r_cols_all = [c for c in train.columns if _keep_r_col(c)]
+if r_cols_all:
+    for _df in (train, valid, test):
+        # レース頭数（順位の反転に使う）
+        n_in_race = _df.groupby(["date","race_code"])["horse_number"].transform("count").astype("float32")
+        # 「順位は小さいほど上位」→ 大きいほど上位になるよう反転（1位→n、n位→1）
+        R = _df[r_cols_all].astype("float32")
+        R_rev = (n_in_race.values.reshape(-1,1) + 1.0) - R.values
+        # 行方向の平均（NaN無視）
+        r_mean_all = np.nanmean(R_rev, axis=1).astype("float32")
+        _df["r_mean_all"] = r_mean_all
+        # レース内で偏差値（50+10z）
+        g = _df.groupby(["date","race_code"])["r_mean_all"]
+        mu = g.transform("mean").astype("float32")
+        sd = g.transform("std").astype("float32").replace(0, np.nan)
+        _df["dev_r_mean_all"] = (50.0 + 10.0 * (_df["r_mean_all"] - mu) / sd).astype("float32").fillna(50.0)
+else:
+    print("   - [NOTE] r_* が見つからなかったため、総合順位特徴はスキップしました。")
+
+
+
 # 置き換え：FEATURES を「分割後・派生作成後」の列から作る
 ALL_COLS_UNION = sorted(set(train.columns) | set(valid.columns) | set(test.columns))
 
@@ -542,12 +433,6 @@ LEAK_DROP = [
 ]
 
 FEATURES = [c for c in ALL_COLS_UNION if c not in set(LEAK_DROP + MERGE_KEYS + ["race_number","date"])]
-
-# --- PATCH B: “万一”残っていても採用しない（恒久対応の二重安全弁） ---
-DROP_B_DUP = {"pred_ev_stage_b_oof","pred_ev_stage_b_pred"}
-if any(c in FEATURES for c in DROP_B_DUP):
-    FEATURES = [c for c in FEATURES if c not in DROP_B_DUP]
-    print("   - [CLEANUP] FEATURES から {pred_ev_stage_b_oof, pred_ev_stage_b_pred} を除外（ANYのみ使用）")
 
 # LightGBM に渡すカテゴリ列は FEATURES との共通部分に限定
 cat_cols_final = [c for c in (cat_cols + extra_cat_cols) if c in FEATURES]
@@ -578,8 +463,8 @@ if suspicious:
 
 # ────────────────────────────────────────────────
 # Cell-4.5 : Soft-Finish OOF特徴の作成（Stage-C 用）
-#   s = 1, 0.25, 0.15, 0.05(4-5着), 0 を TimeSeriesSplit で回帰学習（時系列リーク対策）
-#   string dtypes を category に統一して LightGBM に渡す（型不一致対策）
+#   s = 1, 0.25, 0.15, 0.05(4-5着), 0 を 3-Fold OOF で回帰学習
+#   string dtypes を category に統一して LightGBM に渡す（今回の型エラー対策）
 #   出力: train/valid/test すべてに 'feat_soft_finish' を付与し、feature_cols に追加
 # ────────────────────────────────────────────────
 print("\n" + "="*50)
@@ -590,19 +475,20 @@ import os, json, gc
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
-from sklearn.model_selection import TimeSeriesSplit
+from sklearn.model_selection import KFold
+
 
 # === Winsorize 設定（Train OOF の分布で閾値を決定） =====================
 WINSOR_Q_LOW  = float(os.environ.get("SF_WINSOR_Q_LOW",  0.005))  # 下位0.5%
 WINSOR_Q_HIGH = float(os.environ.get("SF_WINSOR_Q_HIGH", 0.995))  # 上位99.5%
 assert 0.0 <= WINSOR_Q_LOW < WINSOR_Q_HIGH <= 1.0
 
+
 # === 既存メタを拾う（環境差吸収） ==================================
 def _pick_feature_cols():
     for k in ('feature_cols', 'FEATURE_COLS', 'FEATURES'):
         if k in globals(): return list(globals()[k])
     raise RuntimeError("[FATAL] feature_cols/FEATURE_COLS/FEATURES が見つかりません。")
-
 def _pick_cat_cols():
     for k in ('categorical_cols', 'cat_cols', 'CAT_COLS', 'cat_cols_final'):
         if k in globals(): return list(globals()[k])
@@ -614,44 +500,32 @@ SEED = globals().get('SEED', 42)
 FEAT_COLS_ALL = _pick_feature_cols()
 CAT_COLS_RAW  = _pick_cat_cols()
 
-# 明示的に除外（アウトカムや配当などのリーク源が紛れた場合の安全弁）
+# 明示的に除外（アウトカムや配当などのリーク源が紛れた場合に備えた安全弁）
 LEAK_LIKE = {'finishing_position','finish_position','win_payout','place_payout','y_win','y_place','result_time'}
 FEAT_COLS_SF = [c for c in FEAT_COLS_ALL if c not in LEAK_LIKE]
 
+# === string/object を train 由来カテゴリで “category” に統一 =========
+def _coerce_to_train_categories(train_df, apply_dfs, cat_candidates):
+    cat_used = []
+    cats_dict = {}
+    for c in cat_candidates:
+        if c not in train_df.columns:
+            continue
+        dt = str(train_df[c].dtype)
+        if dt in ("category","object","string"):
+            s_tr = train_df[c].astype("string").fillna("__NA__")
+            cats = sorted(s_tr.unique().tolist())
+            cats_dict[c] = cats
+            cat_used.append(c)
+    # apply
+    for df_ in apply_dfs:
+        for c, cats in cats_dict.items():
+            if c in df_.columns:
+                s = df_[c].astype("string").fillna("__NA__")
+                df_[c] = pd.Categorical(s, categories=cats)
+    return cat_used, cats_dict
 
-# （差し替え前の CAT_MAP_FINAL / KEEP_MAP_FINAL ブロックを削除して、これに置換）
-USE_RARE = {}        # 列ごとに RARE_TOKEN を使っているか（True/False）
-CAT_MAP_FINAL = {}   # 各列の最終 categories（順序含む）
-KEEP_MAP_FINAL = {}  # RARE に畳まない値集合（= categories から RARE を除いた集合）
-
-for c in cat_cols_final:  # ← cat_cols ではなく cat_cols_final を使う
-    if c in train.columns and hasattr(train[c].dtype, "categories"):
-        cats = list(train[c].cat.categories.astype("string"))
-        CAT_MAP_FINAL[c] = cats
-        has_rare = (RARE_TOKEN in cats)
-        USE_RARE[c] = has_rare
-        KEEP_MAP_FINAL[c] = set(cats) - ({RARE_TOKEN} if has_rare else set())
-
-def _apply_categorical_template(dfs, col):
-    """学習時に確定した categories/挙動（未知→RARE or 未知→NA）を強制適用"""
-    cats = CAT_MAP_FINAL[col]
-    keep = KEEP_MAP_FINAL[col]
-    has_rare = USE_RARE[col]
-    for df in dfs:
-        s = _norm_code_str(df[col])
-        s = s.where(s.isin(keep), (RARE_TOKEN if has_rare else NA_TOKEN))
-        df[col] = pd.Categorical(s, categories=cats)
-
-# --- ここを追加 ---------------------------------------------------------
-# Soft-Finish で使う候補カテゴリ列（CAT_COLS_RAW）から、
-# 実際に学習時に categories を確定させた列（CAT_MAP_FINAL にある列）のみ採用
-cat_used_sf = [c for c in CAT_COLS_RAW if c in CAT_MAP_FINAL]
-
-# 学習時と同じカテゴリ集合＆未知の扱い（RARE/NA）を Train/Valid/Test 全てに強制適用
-for c in cat_used_sf:
-    _apply_categorical_template([train, valid, test], c)
-# ------------------------------------------------------------------------
-
+cat_used_sf, cat_categories_sf = _coerce_to_train_categories(train, [train, valid, test], CAT_COLS_RAW)
 
 # === Soft-Finish のターゲット s を作成 =================================
 def _soft_finish_target(df):
@@ -665,38 +539,21 @@ def _soft_finish_target(df):
 
 y_sf = _soft_finish_target(train)
 
+
 # --- ここから追加（自己参照/存在チェックガード）-------------------------
-# 1) feat_soft_finish（これから作る特徴）は学習入力から必ず除外
+# feat_soft_finish（これから作る特徴）は学習入力から必ず除外
 EXCLUDE_SF_COLS = {'feat_soft_finish'}
-FEAT_COLS_SF = [c for c in FEAT_COLS_SF if c not in EXCLUDE_SF_COLS]
-
-# 2) Soft-Finish でも B 列は ANY に統一（まず重複列を除去し、ANYを先に組み込む）
-B_REPLACE = {"pred_ev_stage_b_oof", "pred_ev_stage_b_pred"}
-FEAT_COLS_SF = [c for c in FEAT_COLS_SF if c not in B_REPLACE]
-# “any” を使えるなら採用（まずは train にあるかチェック）
-if "pred_ev_stage_b_any" in train.columns and "pred_ev_stage_b_any" not in FEAT_COLS_SF:
-    FEAT_COLS_SF.append("pred_ev_stage_b_any")
-    print("[SF] Soft-Finish入力に 'pred_ev_stage_b_any' を追加しました。")
-
-# 3) 列存在チェック（train→valid/test の順で共通集合へ）
-#    ついでに順序維持＆重複排除もしておく
-FEAT_COLS_SF = [c for c in FEAT_COLS_SF if c in train.columns]
-_common = [c for c in FEAT_COLS_SF if (c in valid.columns and c in test.columns)]
-if len(_common) < len(FEAT_COLS_SF):
-    drop_n = len(FEAT_COLS_SF) - len(_common)
-    print(f"[WARN] Soft-Finish: valid/test に無い列を {drop_n} 個削除しました。")
-FEAT_COLS_SF = list(dict.fromkeys(_common))  # 順序維持で重複排除
-
-# 4) categorical_feature も最終決定列に合わせて同期
+# ついでに、train に存在しない列も落として KeyError を根絶
+FEAT_COLS_SF = [c for c in FEAT_COLS_SF if c not in EXCLUDE_SF_COLS and c in train.columns]
+# categorical_feature にも同じ整合性を取る（LGBMに存在しないcat名を渡さない）
 cat_used_sf = [c for c in cat_used_sf if c in FEAT_COLS_SF]
 # ----------------------------------------------------------------------
 
 
-# === OOF 学習（TimeSeriesSplit で時系列リーク防止） ====================
-sf_n_splits = int(os.environ.get("SF_OOF_K", 5))
-print(f"[INFO] Soft-Finish OOF を作成します: n_splits={sf_n_splits} / splitter=TimeSeriesSplit（将来データ未混入）")
-sf_splitter = TimeSeriesSplit(n_splits=sf_n_splits)
 
+# === 3-Fold OOF 学習 ====================================================
+print(f"[INFO] Soft-Finish OOF を作成します: n_splits=3")
+kf = KFold(n_splits=3, shuffle=False)
 oof_sf = np.zeros(len(train), dtype="float32")
 best_iters = []
 
@@ -723,6 +580,10 @@ params_sf = {
     "num_threads": -1,
 }
 
+
+# タイトル: Soft-Finish（stage-c 補助回帰）Optuna最適パラメータの最小上書き
+# 説明: 上で定義した params_sf を“変更せずに保持”しつつ、Optunaで得た best_params だけを update() で反映します。
+#      既存の目的関数/metric/seed/two_round/max_bin などの契約は維持し、変更はパラメータ群の上書きだけに限定します。
 # === Soft-Finish: Optuna best params で上書き（最小差分）================
 SF_OPTUNA_BEST_PARAMS = {
     "learning_rate": 0.022337835932350347,
@@ -734,25 +595,19 @@ SF_OPTUNA_BEST_PARAMS = {
     "lambda_l1": 5.572042886691552,
     "lambda_l2": 3.741982796639425,
     "min_gain_to_split": 0.006857114218896185,
-    "feature_fraction_bynode": 0.7486419238599451  # v3+ で有効
+    "feature_fraction_bynode": 0.7486419238599451  # 既存に無いキー。LightGBMで有効なので追加入力OK
 }
 _before = {k: params_sf.get(k) for k in SF_OPTUNA_BEST_PARAMS.keys()}
 params_sf.update(SF_OPTUNA_BEST_PARAMS)
 _after  = {k: params_sf.get(k) for k in SF_OPTUNA_BEST_PARAMS.keys()}
-print("[SF-OPTUNA] Soft-Finish params overridden (before -> after):")
+print("[SF-OPTUNA] Soft-Finish params overridden (diff shown as before -> after):")
 for k in SF_OPTUNA_BEST_PARAMS.keys():
     print(f"   - {k}: {_before[k]} -> {_after[k]}")
+# ======================================================================
 
-for fold, (tr_idx, va_idx) in enumerate(sf_splitter.split(train), 1):
-    # ログ（学習の最大日付 < 検証の最小日付 を目視確認できるように）
-    try:
-        d_tr_max = pd.to_datetime(train.iloc[tr_idx]['date']).max()
-        d_va_min = pd.to_datetime(train.iloc[va_idx]['date']).min()
-        d_va_max = pd.to_datetime(train.iloc[va_idx]['date']).max()
-        print(f"  - Fold {fold}/{sf_n_splits} | train<=[{d_tr_max.date()}] -> valid[{d_va_min.date()}~{d_va_max.date()}]")
-    except Exception:
-        print(f"  - Fold {fold}/{sf_n_splits}")
 
+for fold, (tr_idx, va_idx) in enumerate(kf.split(train), 1):
+    print(f"  - Fold {fold}/3")
     X_tr = train.iloc[tr_idx][FEAT_COLS_SF]
     X_va = train.iloc[va_idx][FEAT_COLS_SF]
     y_tr = y_sf[tr_idx]
@@ -833,6 +688,16 @@ print(f"[STAT] (winsor) feat_soft_finish Train  min/p50/p90/p99/max = {qt_tr[0]:
 print(f"[STAT] (winsor) feat_soft_finish Valid  min/p50/p90/p99/max = {qt_va[0]:.3f}/{qt_va[1]:.3f}/{qt_va[2]:.3f}/{qt_va[3]:.3f}/{qt_va[4]:.3f}")
 print(f"[STAT] (winsor) feat_soft_finish Test   min/p50/p90/p99/max = {qt_te[0]:.3f}/{qt_te[1]:.3f}/{qt_te[2]:.3f}/{qt_te[3]:.3f}/{qt_te[4]:.3f}")
 
+
+# 参考統計
+def _q(a): return np.quantile(a, [0, .5, .9, .99, 1.0])
+qt_tr = _q(train['feat_soft_finish'].values)
+qt_va = _q(valid['feat_soft_finish'].values)
+qt_te = _q(test['feat_soft_finish'].values)
+print(f"[STAT] feat_soft_finish (Train) min/p50/p90/p99/max = {qt_tr[0]:.3f}/{qt_tr[1]:.3f}/{qt_tr[2]:.3f}/{qt_tr[3]:.3f}/{qt_tr[4]:.3f}")
+print(f"[STAT] feat_soft_finish (Valid) min/p50/p90/p99/max = {qt_va[0]:.3f}/{qt_va[1]:.3f}/{qt_va[2]:.3f}/{qt_va[3]:.3f}/{qt_va[4]:.3f}")
+print(f"[STAT] feat_soft_finish (Test)  min/p50/p90/p99/max = {qt_te[0]:.3f}/{qt_te[1]:.3f}/{qt_te[2]:.3f}/{qt_te[3]:.3f}/{qt_te[4]:.3f}")
+
 if 'y_win' in train.columns:
     corr = pd.Series(train['feat_soft_finish']).corr(pd.Series(train['y_win']).astype(float))
     print(f"[STAT] Corr(feat_soft_finish, y_win) on Train = {corr:.4f}")
@@ -849,137 +714,47 @@ elif 'FEATURE_COLS' in globals():
 try:
     ART_DIR_C = globals().get('ART_DIR_C', "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c")
     os.makedirs(ART_DIR_C, exist_ok=True)
-
-    # 1) Soft-Finish モデル保存
-    SF_MODEL_PATH = os.path.join(ART_DIR_C, "JRA_stage_c_softfinish_model.pkl")
+    SF_MODEL_PATH = os.path.join(ART_DIR_C, "JRA_stage_c_softfinish_model.txt")
     final_sf.save_model(SF_MODEL_PATH)
 
-    # 2) 既存メタを読み込み（なければ空dict）
     meta_path = globals().get('STAGE_C_META_PATH', os.path.join(ART_DIR_C, "JRA_stage_c_meta.json"))
     meta = {}
     if os.path.exists(meta_path):
-        with open(meta_path, "r", encoding="utf-8") as f:
-            meta = json.load(f)
-
-    # 3) Soft-Finish で使用したカテゴリ集合（本体と完全一致）を準備
-    #    - CAT_MAP_FINAL がある場合：Cell-4 で確定させた categories を使用（推奨）
-    #    - ない場合：フォールバックで train の .cat.categories を使用
-    if 'CAT_MAP_FINAL' in globals():
-        cat_categories_sf = {
-            c: [str(x) for x in CAT_MAP_FINAL[c]]
-            for c in cat_used_sf
-            if c in CAT_MAP_FINAL
-        }
-    else:
-        cat_categories_sf = {}
-        for c in cat_used_sf:
-            if c in train.columns and hasattr(train[c].dtype, "categories"):
-                # dtype.categories をそのまま保存（順序も保持）
-                cat_categories_sf[c] = [str(x) for x in train[c].cat.categories.astype("string")]
-
-    # 4) Soft-Finish メタを上書き（既存キーは保持・必要キーのみ更新）
+        with open(meta_path, "r", encoding="utf-8") as f: meta = json.load(f)
     meta.setdefault("soft_finish", {})
     meta["soft_finish"].update({
-        "model_path": SF_MODEL_PATH,
-        "num_boost_round": int(num_boost_round_sf),
-        "feature_cols": FEAT_COLS_SF,
-        "categorical_cols": cat_used_sf,
-        "cat_categories": cat_categories_sf,   # ← 本体と同一カテゴリ集合を保存
-        # stage-today で同じ caps を使うため
-        "winsor": {
-            "q_low":  float(WINSOR_Q_LOW),
-            "q_high": float(WINSOR_Q_HIGH),
-            "lo":     float(lo),
-            "hi":     float(hi),
-        }
-    })
-
-    # 5) 書き出し
+    "model_path": SF_MODEL_PATH,
+    "num_boost_round": int(num_boost_round_sf),
+    "feature_cols": FEAT_COLS_SF,
+    "categorical_cols": cat_used_sf,
+    "cat_categories": {c: [str(x) for x in cats] for c, cats in cat_categories_sf.items()},
+    # ↓↓↓ 追加（stage-today で同じ caps を使うため） ↓↓↓
+    "winsor": {
+        "q_low":  WINSOR_Q_LOW, "q_high": WINSOR_Q_HIGH,
+        "lo": float(lo), "hi": float(hi)
+    }
+})
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
 
     print(f"[INFO] Soft-Finish モデル/メタを保存しました: {SF_MODEL_PATH}")
-
 except Exception as e:
     print(f"[WARN] Soft-Finishの最終学習/保存で警告: {e}")
 
 print("→ 以降の LightGBM（二値・単勝確率）の学習は、追加済みの 'feat_soft_finish' を含む feature_cols でそのまま実行されます。")
-
-
 
 # ------------------------
 # Cell-5: LightGBM 学習（単勝的中率＝binary, Optuna反映版）
 # ------------------------
 print("\n--- Cell-5: LightGBM学習（単勝的中率＝binary / Optuna最適化パラメータ反映） ---")
 
-
-
-# タイトル: Patch-2 収益志向のサンプル重み（正例：配当×近年×長穴優遇）
-# 説明: 二値目的のまま、儲かる事例の学習寄与を増やしてROIを押し上げます。
-def _make_profit_weights(df, *, bet_unit=BET_UNIT,
-                         payout_gamma=0.6, payout_cap=20.0,
-                         recency_alpha=0.4,  # 0〜1（大きいほど近年重視）
-                         tsr_col="trifecta_support_rate", tsr_beta=0.5):
-    """
-    returns: np.ndarray shape=(len(df),)
-      - 正例(勝ち馬)のみ重み↑、負例は1.0をベース（過学習抑制）
-      - payout_gamma: 0.5〜0.7 推奨
-      - payout_cap:   15〜25 推奨
-      - recency_alpha: 0.3〜0.6 推奨（日付の後ろ1/3〜1/2を強めるイメージ）
-      - tsr_beta: 長穴優遇の強さ（0.3〜0.7）
-    """
-    n = len(df)
-    w = np.ones(n, dtype="float32")
-
-    # 1) 配当重み（正例のみ）
-    if "win_payout" in df.columns:
-        pay = pd.to_numeric(df["win_payout"], errors="coerce").fillna(0.0).values.astype("float32")
-        pos = (df["y_win"].values.astype("int8") == 1)
-        pay_factor = np.power(np.maximum(pay / float(bet_unit), 1.0), payout_gamma)
-        if payout_cap is not None:
-            pay_factor = np.minimum(pay_factor, float(payout_cap))
-        w[pos] *= pay_factor[pos]
-
-    # 2) 近年重み（全例に掛ける）
-    if "date" in df.columns:
-        d = pd.to_datetime(df["date"]).view("int64")  # ns
-        d = (d - np.nanmin(d)) / max(1, (np.nanmax(d) - np.nanmin(d)))
-        rec_factor = (1.0 - recency_alpha) + recency_alpha * d
-        w *= rec_factor.astype("float32")
-
-    # 3) 長穴優遇（正例のみ / 市場確率が低いほど↑）
-    if tsr_col in df.columns:
-        # レース内で確率化（合計1）
-        g = df[["date","race_code"]].apply(tuple, axis=1).values
-        s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).values.astype("float32")
-        # sum by race
-        # 速度より明快さ優先
-        tsr_prob = (pd.Series(s).groupby(g).transform("sum").replace(0, np.nan).values)
-        tsr_prob = (s / tsr_prob); tsr_prob = np.nan_to_num(tsr_prob, nan=0.0)
-        longshot_boost = 1.0 / np.sqrt(1e-6 + tsr_prob)  # 低TSRほど↑
-        longshot_boost = np.power(longshot_boost, tsr_beta).astype("float32")
-        pos = (df["y_win"].values.astype("int8") == 1)
-        w[pos] *= longshot_boost[pos]
-
-    # 正の有限値にクリップ（念のため）
-    w = np.clip(w, 1e-3, 1e6).astype("float32")
-    return w
-
-
-
 # 万一 'feat_soft_finish' が FEATURES に未追加なら注入（存在チェック付き）
 if "feat_soft_finish" in train.columns and "feat_soft_finish" not in FEATURES:
     FEATURES.append("feat_soft_finish")
 
-# 学習/検証データ
+# 学習/検証データの抽出
 X_tr = train[FEATURES].copy(); y_tr = train["y_win"].astype("int8").values
 X_va = valid[FEATURES].copy(); y_va = valid["y_win"].astype("int8").values
-
-# ★ 追加: 収益志向のサンプル重み
-w_tr = _make_profit_weights(train)
-w_va = np.ones(len(valid), dtype="float32")  # validは評価なので1.0固定推奨
-
-print(f"[WEIGHT] train mean={w_tr.mean():.3f} p90={np.quantile(w_tr, .9):.3f} max={w_tr.max():.3f}")
 
 # カテゴリ列: 存在確認しつつ category 型を担保
 cat_cols_exist = [c for c in (cat_cols_final if 'cat_cols_final' in globals() else []) if c in X_tr.columns]
@@ -1030,11 +805,9 @@ seed_ext = {
 lgb_params = {**base_params, **optuna_best, **seed_ext}
 
 # LightGBM Dataset 構築
+lgb_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_cols_exist, free_raw_data=False)
+lgb_va = lgb.Dataset(X_va, label=y_va, categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
 
-lgb_tr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
-                     categorical_feature=cat_cols_exist, free_raw_data=False)
-lgb_va = lgb.Dataset(X_va, label=y_va, weight=w_va,
-                     categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
 # コールバック
 callbacks = [
     lgb.early_stopping(stopping_rounds=200, verbose=True),
@@ -1060,43 +833,6 @@ model = lgb.train(
 
 best_iter = model.best_iteration or model.current_iteration()
 print(f"   - best_iter = {best_iter}  （Optuna再検証の目安 ≈ 80）")
-
-# 学習直後のこの辺りに追加
-model.save_model(STAGE_C_MODEL_PATH)
-print(f"   - モデル保存: {STAGE_C_MODEL_PATH}")
-
-
-# --- Compat: 後段セルが探す単一Boosterをエクスポート ---
-try:
-    booster_alias = None
-    if isinstance(model, lgb.Booster):
-        booster_alias = model
-    elif hasattr(model, "members") and len(model.members) > 0:
-        booster_alias = model.members[0]                 # 代表(#1)
-    elif hasattr(model, "models") and len(model.models) > 0:
-        booster_alias = model.models[0]
-
-    if booster_alias is not None:
-        gbm = booster_alias          # 後段セルが探す候補その1
-        gbm_final = booster_alias    # 候補その2
-        # best_iter もだいたい合う値を置いておく（使われる場合に備え）
-        try:
-            _its = []
-            if isinstance(model, lgb.Booster):
-                _its = [getattr(model, "best_iteration", 0) or 0]
-            elif hasattr(model, "members"):
-                _its = [getattr(m, "best_iteration", 0) or 0 for m in model.members]
-            elif hasattr(model, "models"):
-                _its = [getattr(m, "best_iteration", 0) or 0 for m in model.models]
-            best_iter = int(np.median([i for i in _its if i])) if _its else None
-        except Exception:
-            pass
-        print("[Compat] Exported Booster alias as 'gbm' / 'gbm_final'（best_iter≈%s）" % str(best_iter))
-    else:
-        print("[Compat] Booster alias not exported（unknown model container）")
-except Exception as e:
-    print(f"[Compat][WARN] Booster aliasing failed: {e}")
-
 
 
 # ────────────────────────────────────────────────
@@ -1135,8 +871,7 @@ def _get_model_and_best_iter():
     raise RuntimeError("[FATAL] 学習済み LightGBM モデルが見つかりません（model / gbm_final / gbm）。")
 
 FEATURE_COLS = _get_feature_cols()
-CAT_COLS     = [c for c in _get_cat_cols() if c in FEATURE_COLS]  # ← ここをこうする
-
+CAT_COLS     = _get_cat_cols()
 TARGET       = 'y_win'
 BET_UNIT     = BET_UNIT if 'BET_UNIT' in globals() else 100
 
@@ -1185,26 +920,17 @@ def _learn_temperature_softmax(raw_logit, y, gid):
     res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)], method='L-BFGS-B')
     return float(res.x[0]), float(res.fun)
 
-# タイトル: Cell-X（binary OOF → 温度学習）最小修正版＋OOFカバレッジ・マスク導入
-# 説明: 単勝binaryモデルのOOFロジットを作成し、レース内softmaxの温度Tを学習します。
-#       追加点は2つだけ：
-#         (1) OOFで一度でもvalidに出た行を True にするマスク oof_covered を導入
-#         (2) 温度学習は “有効行（oof_covered==True）” に限定して実施
-#       ※ Train評価側のマスク適用はこのセル外（評価セル）で行ってください。
-#          本セルの出力変数: oof_logit（全行; 未カバーは0のまま）, OOF_MASK（有効行ブール配列）
-
 # ---- OOF（raw_logit）作成 ------------------------------------------
 from sklearn.model_selection import KFold, TimeSeriesSplit
 import numpy as np, gc, lightgbm as lgb
 
-N_SPLITS = int(os.environ.get("STAGEC_OOF_K", 5))
-USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルト: TimeSeriesSplit（将来データ混入防止）
+N_SPLITS = int(os.environ.get("STAGEC_OOF_K", 3))
+USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "0") == "1"
 print(f"[INFO] OOFを作成します: n_splits={N_SPLITS} / splitter={'TimeSeriesSplit' if USE_TSS else 'KFold'}")
 splitter = TimeSeriesSplit(n_splits=N_SPLITS) if USE_TSS else KFold(n_splits=N_SPLITS, shuffle=False)
 
-oof_logit   = np.zeros(len(train), dtype='float64')   # raw_score（logit）を格納（未カバーは0→一様softmaxになるが、評価は別セルでマスク推奨）
-oof_covered = np.zeros(len(train), dtype=bool)        # ★ 追加: OOFで一度でもvalidになった行を True にするマスク
-best_iters  = []
+oof_logit = np.zeros(len(train), dtype='float64')  # raw_score（logit）を格納
+best_iters = []
 
 # 1) 学習パラメータのベースを拾う（無ければデフォルト）
 def _pick_lgb_params():
@@ -1223,7 +949,7 @@ def _pick_lgb_params():
 _lgb_base = _pick_lgb_params()
 
 # 2) 浅いコピー → OOF向けの上書き（分散化パッチ）
-params_oof = _lgb_base.copy()
+params_oof = _lgb_base.copy()          # ← dict(_lgb_base) でもOK（浅いコピー）
 params_oof.update({
     "objective": "binary",
     "metric": "binary_logloss",
@@ -1259,19 +985,6 @@ print("[INFO] OOF LightGBM パラメータ（要約）:", {
     if k in params_oof
 })
 
-
-# OOF ループ中の d_tr / d_va 構築直前に追加
-w_all = _make_profit_weights(train)  # train全体の重みを先に作る
-...
-w_tr = w_all[tr_idx]
-w_va = np.ones_like(y_va, dtype="float32")  # OOF検証側は1.0でOK（温度学習の安定を優先）
-d_tr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
-                   categorical_feature=CAT_COLS, params=_dataset_params, free_raw_data=False)
-d_va = lgb.Dataset(X_va, label=y_va, weight=w_va,
-                   categorical_feature=CAT_COLS, reference=d_tr, params=_dataset_params, free_raw_data=False)
-
-
-
 for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     print(f"  - Fold {fold}/{N_SPLITS}")
 
@@ -1306,19 +1019,17 @@ for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     )
 
     # raw_score=True → ロジット（margin）を取得
-    oof_logit[va_idx]   = fold_model.predict(X_va, num_iteration=fold_model.best_iteration, raw_score=True)
-    oof_covered[va_idx] = True  # ★ 追加: このfoldでOOFが付与された行を有効化
+    oof_logit[va_idx] = fold_model.predict(
+        X_va, num_iteration=fold_model.best_iteration, raw_score=True
+    )
     best_iters.append(int(fold_model.best_iteration or 100))
 
     # メモリ解放
     del d_tr, d_va, X_tr, X_va, y_tr, y_va, fold_model
     gc.collect()
 
-cov_rate = float(oof_covered.mean())
 print(f"[INFO] OOF（raw_logit）完了: shape={oof_logit.shape}  / best_iter(median/mean)={np.median(best_iters):.0f}/{np.mean(best_iters):.1f}")
-print(f"[INFO] OOFカバレッジ: {cov_rate*100:.2f}%  (未カバー={int((~oof_covered).sum())}行)")
-# グローバルへ露出（後段のTrain評価セルで使えるように）
-OOF_MASK = oof_covered.copy()
+
 
 # ---- 学習済み最終モデルの raw_logit を取得（Valid/Test） -------------
 model, best_iter = _get_model_and_best_iter()
@@ -1331,19 +1042,13 @@ gid_va = _group_ids(valid, ("date","race_code"))
 y_tr   = train[TARGET].astype('int8').values
 y_va   = valid[TARGET].astype('int8').values
 
-# （参考）併合用の下準備は残すが、今回のT学習はOOFの“有効行のみ”で実施
-# p_for_T_logit = np.concatenate([oof_logit, valid_logit])
-# g_for_T       = np.concatenate([gid_tr, gid_va])
-# y_for_T       = np.concatenate([y_tr, y_va])
+# 学習の安定化のため OOF+Valid を併合
+p_for_T_logit = np.concatenate([oof_logit, valid_logit])
+g_for_T       = np.concatenate([gid_tr, gid_va])
+y_for_T       = np.concatenate([y_tr, y_va])
 
-# ★ 重要: 温度学習は OOFの“有効行”に限定
-m_use = OOF_MASK
-if not np.any(m_use):
-    raise RuntimeError("[FATAL] 温度学習用のOOF有効行がありません。TimeSeriesSplitとデータ分割を確認してください。")
-
-T_star, _ = _learn_temperature_softmax(oof_logit[m_use], y_tr[m_use], gid_tr[m_use])
-print(f"[INFO] 学習した温度: T={T_star:.4f}  （OOF有効行={m_use.sum()} / {len(m_use)}）")
-
+T_star, nll_star = _learn_temperature_softmax(p_for_T_logit, y_for_T, g_for_T)
+print(f"[INFO] 学習した温度: T={T_star:.4f}  (multiclass NLL={nll_star:.5f})")
 
 # ---- softmax（T=1 と T=T_star）で確率化 ------------------------------
 def _probs_from_logit(df, raw_logit, T):
@@ -1422,7 +1127,7 @@ test['pred_win_prob']  = test_prob_cal.astype('float32')
 
 # ---- 温度をメタ保存（任意） ----------------------------------------
 try:
-    meta_path = globals().get('STAGE_C_META_PATH', os.path.join(ART_DIR_C, "JRA_stage_c_meta.json"))
+    meta_path = globals().get('STAGE_C_META_PATH', None)
     if meta_path:
         _meta = {}
         if os.path.exists(meta_path):
@@ -1432,7 +1137,6 @@ try:
         print(f"[INFO] 温度(T)をメタへ保存: {meta_path}")
 except Exception as e:
     print(f"[WARN] 温度メタ保存に失敗: {e}")
-
 
 print("\n[NOTE] 以降のデシル/TSR/Top-k評価は『pred_win_prob（= softmax後・温度較正済）』を使用します。")
 
@@ -1632,43 +1336,8 @@ try:
 except Exception as e:
     print(f"   - [WARN] 予測の書き出しに失敗: {e}")
 
-# メタ（既存を保持しつつ必要項目だけ上書き）
-meta_path = os.path.join(ART_DIR_C, "JRA_stage_c_meta.json")
-
-# 既存メタを読み込み（無ければ空dict）
-_meta = {}
-if os.path.exists(meta_path):
-    try:
-        with open(meta_path, "r", encoding="utf-8") as f:
-            _meta = json.load(f)
-    except Exception:
-        _meta = {}
-
-# === 追加：Stage-C のカテゴリ全集合を保存（today推論で厳密一致させる） ===
-cat_categories_c = {}
-for c in cat_cols_final:
-    if c in train.columns:
-        # ここは “train のユニーク” ではなく “確定 categories”
-        cats = list(train[c].cat.categories.astype("string"))
-        # 念のため順序安定化（任意）
-        cat_categories_c[c] = list(cats)
-
-_meta["cat_categories_c"] = cat_categories_c
-
-# --- Soft-Finish のメタを最終メタに合流 ---
-sf_meta = {
-    "model_path": os.path.join(ART_DIR_C, "JRA_stage_c_softfinish_model.pkl"),
-    "num_boost_round": int(num_boost_round_sf),
-    "feature_cols": FEAT_COLS_SF,
-    "categorical_cols": cat_used_sf,
-    "cat_categories": {c: CAT_MAP_FINAL[c] for c in cat_used_sf},
-    "winsor": {"q_low": WINSOR_Q_LOW, "q_high": WINSOR_Q_HIGH, "lo": float(lo), "hi": float(hi)}
-}
-_meta["soft_finish"] = sf_meta
-
-
-# 今回更新するキーだけ上書き
-_meta.update({
+# メタ
+meta = {
     "seed": SEED,
     "train_range": [str(TRAIN_START_DATE.date()), str(TRAIN_END_DATE.date())],
     "valid_range": [str(VALID_START_DATE.date()), str(VALID_END_DATE.date())],
@@ -1677,14 +1346,11 @@ _meta.update({
     "categorical_features": cat_cols_final,
     "best_iter": int(best_iter),
     "cov": probe,
-    "model_path": STAGE_C_MODEL_PATH,  # ← 追加
-})
-
-# 保存（既存の soft_finish / temperature_softmax は保持される）
+}
+meta_path = os.path.join(ART_DIR_C, "JRA_stage_c_meta.json")
 with open(meta_path, "w", encoding="utf-8") as f:
-    json.dump(_meta, f, ensure_ascii=False, indent=2)
+    json.dump(meta, f, ensure_ascii=False, indent=2)
 print(f"   - META 保存:  {meta_path}")
-
 
 print("\n✅ Stage-C 完了（単勝的中率モデル / 厳格マージ＆停止ガード）")
 
@@ -1814,65 +1480,3 @@ _ = top1_margin_report(valid, name="Valid")
 _ = top1_margin_report(test,  name="Test")
 
 
-# --- Cell-X2: 特徴量重要度 Top50（Stage-C / LightGBM） ---
-import os, json, re
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-
-# 保存先（JRA06固定）
-STAGE_C_ART_DIR = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_c"
-os.makedirs(STAGE_C_ART_DIR, exist_ok=True)
-FI_CSV_PATH = os.path.join(STAGE_C_ART_DIR, "JRA_stage_c_feature_importance.csv")
-
-# 1) Booster を取得
-booster = None
-for cand in ["model", "gbm_final", "bst"]:
-    if cand in globals() and hasattr(globals()[cand], "feature_importance"):
-        booster = globals()[cand]
-        print(f"[INFO] Booster 検出: {cand}")
-        break
-if booster is None:
-    raise RuntimeError("LightGBM の学習済みモデル（model / gbm_final / bst）が見つかりません。学習セルの直後で実行してください。")
-
-# 2) 重要度をDataFrame化（gain / split 両方）
-feat_names = booster.feature_name()
-fi_gain  = booster.feature_importance(importance_type="gain")
-fi_split = booster.feature_importance(importance_type="split")
-fi = pd.DataFrame({"feature": feat_names, "gain": fi_gain, "split": fi_split})
-fi["gain_norm"] = fi["gain"] / (fi["gain"].sum() + 1e-12)
-fi = fi.sort_values("gain", ascending=False).reset_index(drop=True)
-
-# 3) 表示：Top 50
-topn = 50
-print("\n[Feature Importance] Top 50 by GAIN")
-disp = fi.head(topn).copy()
-# 見やすいように丸め
-disp["gain_norm"] = disp["gain_norm"].map(lambda x: f"{x:.4f}")
-disp["gain"] = disp["gain"].map(lambda x: f"{x:.1f}")
-print(disp.to_string(index=False))
-
-# 4) CSV保存（上位200も併せて保存）
-fi.head(200).to_csv(FI_CSV_PATH, index=False)
-print(f"\n[SAVE] 重要度CSVを書き出しました: {FI_CSV_PATH}")
-
-# 5) 可視化：水平バー（Top 50）
-plt.figure(figsize=(10, max(6, int(0.22*len(disp)))))
-plt.barh(disp["feature"][::-1], disp["gain"].astype(float)[::-1])
-plt.xlabel("gain")
-plt.ylabel("feature")
-plt.title("Stage-C Feature Importance (Top 50 by gain)")
-plt.tight_layout()
-plt.show()
-
-# 6) 簡易リークスキャン（疑わしいトークンが上位にいないかを目視補助）
-suspect_tokens = [
-    "odds", "payout", "trifecta_support_rate", "final", "確定", "popular", "popularity"
-]
-sus = [f for f in fi.head(topn)["feature"] if any(t in f.lower() for t in suspect_tokens)]
-if sus:
-    print("\n[LEAK-SCAN] Top50内で疑わしい特徴名（手動点検を推奨）:")
-    for s in sus:
-        print("  -", s)
-else:
-    print("\n[LEAK-SCAN] Top50内に典型的なリークトークンは見当たりません。")
