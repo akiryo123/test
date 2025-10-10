@@ -561,16 +561,6 @@ if obj_bad:
 
 print(f"   - v2 特徴量 数: {len(FEATURES)}  （カテゴリ列: {len(cat_cols_final)}）")
 
-# Cell-4 のカテゴリ処理が終わった直後に追加
-CAT_MAP_FINAL = {}      # 各列の最終 categories（順序含む）
-KEEP_MAP_FINAL = {}     # RARE へ畳まない値集合（= categories から RARE を除いた集合）
-
-for c in cat_cols:  # ← あなたのコードで使っているカテゴリ列リスト
-    if c in train.columns and hasattr(train[c].dtype, "categories"):
-        cats = list(train[c].cat.categories.astype("string"))
-        CAT_MAP_FINAL[c] = cats
-        KEEP_MAP_FINAL[c] = set(cats) - {"___RARE___"}  # RARE 以外は “保持”
-
 
 # ------------------------
 # Cell-4.5: 健全性ガード（エラー停止）
@@ -922,13 +912,74 @@ print("→ 以降の LightGBM（二値・単勝確率）の学習は、追加済
 # ------------------------
 print("\n--- Cell-5: LightGBM学習（単勝的中率＝binary / Optuna最適化パラメータ反映） ---")
 
+
+
+# タイトル: Patch-2 収益志向のサンプル重み（正例：配当×近年×長穴優遇）
+# 説明: 二値目的のまま、儲かる事例の学習寄与を増やしてROIを押し上げます。
+def _make_profit_weights(df, *, bet_unit=BET_UNIT,
+                         payout_gamma=0.6, payout_cap=20.0,
+                         recency_alpha=0.4,  # 0〜1（大きいほど近年重視）
+                         tsr_col="trifecta_support_rate", tsr_beta=0.5):
+    """
+    returns: np.ndarray shape=(len(df),)
+      - 正例(勝ち馬)のみ重み↑、負例は1.0をベース（過学習抑制）
+      - payout_gamma: 0.5〜0.7 推奨
+      - payout_cap:   15〜25 推奨
+      - recency_alpha: 0.3〜0.6 推奨（日付の後ろ1/3〜1/2を強めるイメージ）
+      - tsr_beta: 長穴優遇の強さ（0.3〜0.7）
+    """
+    n = len(df)
+    w = np.ones(n, dtype="float32")
+
+    # 1) 配当重み（正例のみ）
+    if "win_payout" in df.columns:
+        pay = pd.to_numeric(df["win_payout"], errors="coerce").fillna(0.0).values.astype("float32")
+        pos = (df["y_win"].values.astype("int8") == 1)
+        pay_factor = np.power(np.maximum(pay / float(bet_unit), 1.0), payout_gamma)
+        if payout_cap is not None:
+            pay_factor = np.minimum(pay_factor, float(payout_cap))
+        w[pos] *= pay_factor[pos]
+
+    # 2) 近年重み（全例に掛ける）
+    if "date" in df.columns:
+        d = pd.to_datetime(df["date"]).view("int64")  # ns
+        d = (d - np.nanmin(d)) / max(1, (np.nanmax(d) - np.nanmin(d)))
+        rec_factor = (1.0 - recency_alpha) + recency_alpha * d
+        w *= rec_factor.astype("float32")
+
+    # 3) 長穴優遇（正例のみ / 市場確率が低いほど↑）
+    if tsr_col in df.columns:
+        # レース内で確率化（合計1）
+        g = df[["date","race_code"]].apply(tuple, axis=1).values
+        s = pd.to_numeric(df[tsr_col], errors="coerce").fillna(0.0).values.astype("float32")
+        # sum by race
+        # 速度より明快さ優先
+        tsr_prob = (pd.Series(s).groupby(g).transform("sum").replace(0, np.nan).values)
+        tsr_prob = (s / tsr_prob); tsr_prob = np.nan_to_num(tsr_prob, nan=0.0)
+        longshot_boost = 1.0 / np.sqrt(1e-6 + tsr_prob)  # 低TSRほど↑
+        longshot_boost = np.power(longshot_boost, tsr_beta).astype("float32")
+        pos = (df["y_win"].values.astype("int8") == 1)
+        w[pos] *= longshot_boost[pos]
+
+    # 正の有限値にクリップ（念のため）
+    w = np.clip(w, 1e-3, 1e6).astype("float32")
+    return w
+
+
+
 # 万一 'feat_soft_finish' が FEATURES に未追加なら注入（存在チェック付き）
 if "feat_soft_finish" in train.columns and "feat_soft_finish" not in FEATURES:
     FEATURES.append("feat_soft_finish")
 
-# 学習/検証データの抽出
+# 学習/検証データ
 X_tr = train[FEATURES].copy(); y_tr = train["y_win"].astype("int8").values
 X_va = valid[FEATURES].copy(); y_va = valid["y_win"].astype("int8").values
+
+# ★ 追加: 収益志向のサンプル重み
+w_tr = _make_profit_weights(train)
+w_va = np.ones(len(valid), dtype="float32")  # validは評価なので1.0固定推奨
+
+print(f"[WEIGHT] train mean={w_tr.mean():.3f} p90={np.quantile(w_tr, .9):.3f} max={w_tr.max():.3f}")
 
 # カテゴリ列: 存在確認しつつ category 型を担保
 cat_cols_exist = [c for c in (cat_cols_final if 'cat_cols_final' in globals() else []) if c in X_tr.columns]
@@ -979,9 +1030,11 @@ seed_ext = {
 lgb_params = {**base_params, **optuna_best, **seed_ext}
 
 # LightGBM Dataset 構築
-lgb_tr = lgb.Dataset(X_tr, label=y_tr, categorical_feature=cat_cols_exist, free_raw_data=False)
-lgb_va = lgb.Dataset(X_va, label=y_va, categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
 
+lgb_tr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
+                     categorical_feature=cat_cols_exist, free_raw_data=False)
+lgb_va = lgb.Dataset(X_va, label=y_va, weight=w_va,
+                     categorical_feature=cat_cols_exist, reference=lgb_tr, free_raw_data=False)
 # コールバック
 callbacks = [
     lgb.early_stopping(stopping_rounds=200, verbose=True),
@@ -1007,6 +1060,10 @@ model = lgb.train(
 
 best_iter = model.best_iteration or model.current_iteration()
 print(f"   - best_iter = {best_iter}  （Optuna再検証の目安 ≈ 80）")
+
+# 学習直後のこの辺りに追加
+model.save_model(STAGE_C_MODEL_PATH)
+print(f"   - モデル保存: {STAGE_C_MODEL_PATH}")
 
 
 # --- Compat: 後段セルが探す単一Boosterをエクスポート ---
@@ -1078,7 +1135,8 @@ def _get_model_and_best_iter():
     raise RuntimeError("[FATAL] 学習済み LightGBM モデルが見つかりません（model / gbm_final / gbm）。")
 
 FEATURE_COLS = _get_feature_cols()
-CAT_COLS     = _get_cat_cols()
+CAT_COLS     = [c for c in _get_cat_cols() if c in FEATURE_COLS]  # ← ここをこうする
+
 TARGET       = 'y_win'
 BET_UNIT     = BET_UNIT if 'BET_UNIT' in globals() else 100
 
@@ -1127,17 +1185,26 @@ def _learn_temperature_softmax(raw_logit, y, gid):
     res = minimize(nll, x0=[1.0], bounds=[(0.05, 10.0)], method='L-BFGS-B')
     return float(res.x[0]), float(res.fun)
 
+# タイトル: Cell-X（binary OOF → 温度学習）最小修正版＋OOFカバレッジ・マスク導入
+# 説明: 単勝binaryモデルのOOFロジットを作成し、レース内softmaxの温度Tを学習します。
+#       追加点は2つだけ：
+#         (1) OOFで一度でもvalidに出た行を True にするマスク oof_covered を導入
+#         (2) 温度学習は “有効行（oof_covered==True）” に限定して実施
+#       ※ Train評価側のマスク適用はこのセル外（評価セル）で行ってください。
+#          本セルの出力変数: oof_logit（全行; 未カバーは0のまま）, OOF_MASK（有効行ブール配列）
+
 # ---- OOF（raw_logit）作成 ------------------------------------------
 from sklearn.model_selection import KFold, TimeSeriesSplit
 import numpy as np, gc, lightgbm as lgb
 
 N_SPLITS = int(os.environ.get("STAGEC_OOF_K", 5))
-USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルトを TimeSeriesSplit に変更（リーク対策）
+USE_TSS  = os.environ.get("STAGEC_OOF_TSS", "1") == "1"  # ← デフォルト: TimeSeriesSplit（将来データ混入防止）
 print(f"[INFO] OOFを作成します: n_splits={N_SPLITS} / splitter={'TimeSeriesSplit' if USE_TSS else 'KFold'}")
 splitter = TimeSeriesSplit(n_splits=N_SPLITS) if USE_TSS else KFold(n_splits=N_SPLITS, shuffle=False)
 
-oof_logit = np.zeros(len(train), dtype='float64')  # raw_score（logit）を格納
-best_iters = []
+oof_logit   = np.zeros(len(train), dtype='float64')   # raw_score（logit）を格納（未カバーは0→一様softmaxになるが、評価は別セルでマスク推奨）
+oof_covered = np.zeros(len(train), dtype=bool)        # ★ 追加: OOFで一度でもvalidになった行を True にするマスク
+best_iters  = []
 
 # 1) 学習パラメータのベースを拾う（無ければデフォルト）
 def _pick_lgb_params():
@@ -1156,7 +1223,7 @@ def _pick_lgb_params():
 _lgb_base = _pick_lgb_params()
 
 # 2) 浅いコピー → OOF向けの上書き（分散化パッチ）
-params_oof = _lgb_base.copy()          # ← dict(_lgb_base) でもOK（浅いコピー）
+params_oof = _lgb_base.copy()
 params_oof.update({
     "objective": "binary",
     "metric": "binary_logloss",
@@ -1192,6 +1259,19 @@ print("[INFO] OOF LightGBM パラメータ（要約）:", {
     if k in params_oof
 })
 
+
+# OOF ループ中の d_tr / d_va 構築直前に追加
+w_all = _make_profit_weights(train)  # train全体の重みを先に作る
+...
+w_tr = w_all[tr_idx]
+w_va = np.ones_like(y_va, dtype="float32")  # OOF検証側は1.0でOK（温度学習の安定を優先）
+d_tr = lgb.Dataset(X_tr, label=y_tr, weight=w_tr,
+                   categorical_feature=CAT_COLS, params=_dataset_params, free_raw_data=False)
+d_va = lgb.Dataset(X_va, label=y_va, weight=w_va,
+                   categorical_feature=CAT_COLS, reference=d_tr, params=_dataset_params, free_raw_data=False)
+
+
+
 for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     print(f"  - Fold {fold}/{N_SPLITS}")
 
@@ -1226,18 +1306,19 @@ for fold, (tr_idx, va_idx) in enumerate(splitter.split(train), 1):
     )
 
     # raw_score=True → ロジット（margin）を取得
-    oof_logit[va_idx] = fold_model.predict(
-        X_va, num_iteration=fold_model.best_iteration, raw_score=True
-    )
+    oof_logit[va_idx]   = fold_model.predict(X_va, num_iteration=fold_model.best_iteration, raw_score=True)
+    oof_covered[va_idx] = True  # ★ 追加: このfoldでOOFが付与された行を有効化
     best_iters.append(int(fold_model.best_iteration or 100))
 
     # メモリ解放
     del d_tr, d_va, X_tr, X_va, y_tr, y_va, fold_model
     gc.collect()
 
+cov_rate = float(oof_covered.mean())
 print(f"[INFO] OOF（raw_logit）完了: shape={oof_logit.shape}  / best_iter(median/mean)={np.median(best_iters):.0f}/{np.mean(best_iters):.1f}")
-
-
+print(f"[INFO] OOFカバレッジ: {cov_rate*100:.2f}%  (未カバー={int((~oof_covered).sum())}行)")
+# グローバルへ露出（後段のTrain評価セルで使えるように）
+OOF_MASK = oof_covered.copy()
 
 # ---- 学習済み最終モデルの raw_logit を取得（Valid/Test） -------------
 model, best_iter = _get_model_and_best_iter()
@@ -1250,14 +1331,19 @@ gid_va = _group_ids(valid, ("date","race_code"))
 y_tr   = train[TARGET].astype('int8').values
 y_va   = valid[TARGET].astype('int8').values
 
-# 学習の安定化のため OOF+Valid を併合
-p_for_T_logit = np.concatenate([oof_logit, valid_logit])
-g_for_T       = np.concatenate([gid_tr, gid_va])
-y_for_T       = np.concatenate([y_tr, y_va])
+# （参考）併合用の下準備は残すが、今回のT学習はOOFの“有効行のみ”で実施
+# p_for_T_logit = np.concatenate([oof_logit, valid_logit])
+# g_for_T       = np.concatenate([gid_tr, gid_va])
+# y_for_T       = np.concatenate([y_tr, y_va])
 
-#T_star, nll_star = _learn_temperature_softmax(p_for_T_logit, y_for_T, g_for_T)
-T_star, _ = _learn_temperature_softmax(oof_logit, y_tr, gid_tr)
-print(f"[INFO] 学習した温度: T={T_star:.4f} ") #  (multiclass NLL={nll_star:.5f})")
+# ★ 重要: 温度学習は OOFの“有効行”に限定
+m_use = OOF_MASK
+if not np.any(m_use):
+    raise RuntimeError("[FATAL] 温度学習用のOOF有効行がありません。TimeSeriesSplitとデータ分割を確認してください。")
+
+T_star, _ = _learn_temperature_softmax(oof_logit[m_use], y_tr[m_use], gid_tr[m_use])
+print(f"[INFO] 学習した温度: T={T_star:.4f}  （OOF有効行={m_use.sum()} / {len(m_use)}）")
+
 
 # ---- softmax（T=1 と T=T_star）で確率化 ------------------------------
 def _probs_from_logit(df, raw_logit, T):
