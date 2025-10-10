@@ -1,0 +1,802 @@
+# ────────────────────────────────────────────────
+# ２、JRA06 - 能力指数予測モデル（Stage-SP）
+# ────────────────────────────────────────────────
+
+# ────────────────────────────────────────────────
+# Cell-1 : 共通 import & 定数 - JRA能力指数予測用に調整
+# ────────────────────────────────────────────────
+import pandas as pd
+import numpy as np
+import polars as pl # データ読み込みにpolarsを使用
+import lightgbm as lgb
+import os
+import time
+import warnings
+#from sklearn.preprocessing import OrdinalEncoder
+#from category_encoders import TargetEncoder
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score, mean_squared_log_error
+from sklearn.model_selection import KFold
+import joblib
+import json
+import pathlib
+import matplotlib.pyplot as plt
+from pandas.api.types import is_categorical_dtype # ★【追加】スキーマ保存のためにインポート
+from sklearn.model_selection import TimeSeriesSplit
+
+
+warnings.filterwarnings("ignore")
+
+# ---------- JRA用 入出力ファイル ----------
+BASE_PARQUET = "/content/drive/My Drive/Colab/gpt/JRA06/JRA_base_data_2016.parquet" # Phase-1の出力
+SEED = 42
+
+# JRA 能力指数予測モデルのアーティファクト保存先ディレクトリ
+ART_TIME_INDEX_DIR = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_time_index_S"
+# モデル本体の保存パス
+TIME_INDEX_MODEL_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_time_index_model.pkl")
+# メタ情報 (best_iter など) の保存パス
+TIME_INDEX_META_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_time_index_meta.json")
+# 特徴量リストの保存パス
+TIME_INDEX_FEATURE_JSON_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_feature_cols_time_index.json")
+# カテゴリ列リストの保存パス
+TIME_INDEX_CAT_COLS_JSON_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_cat_cols_time_index.json")
+# 最終的な派生特徴量を含むDataFrameの保存パス
+DERIVED_FEATURES_SP_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_derived_features_from_sp_model.parquet")
+# ★【追加】スキーマ契約ファイルのパス
+SP_SCHEMA_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_sp_schema.json")
+
+
+# 保存ディレクトリを作成 (存在しない場合のみ)
+pathlib.Path(ART_TIME_INDEX_DIR).mkdir(parents=True, exist_ok=True)
+print(f"能力指数モデル アーティファクト保存先ディレクトリ: {ART_TIME_INDEX_DIR}")
+
+
+# === Stage-CAND 受け渡し ===
+CAND_DERIVED_PATH = "/content/drive/My Drive/Colab/gpt/JRA06/artifacts_stage_cand/JRA_derived_features_from_stage_cand.parquet"
+
+# 使い方のトグル（必要に応じて切替）
+USE_CAND_FEATURES = True               # cand_* 特徴を学習に入れる
+USE_CAND_SAMPLE_WEIGHT = True          # sample_weight_cand を学習重みに使う
+FILTER_TRAIN_BY_EXCLUDE = True         # 学習データで exclude_flag_095==1 を除外
+
+
+
+# ────────────────────────────────────────────────
+# Cell-2 : データ読み込みとターゲット定義、フィルタリング - JRA能力指数予測用
+# ────────────────────────────────────────────────
+print(f"\n◎ Loading JRA base data from: {BASE_PARQUET}")
+df = pl.read_parquet(BASE_PARQUET).to_pandas()
+print(f"Loaded JRA data shape: {df.shape}")
+
+# 目的変数を'time_index'（走破タイム）として使用
+TARGET_COLUMN = "time_index"
+# 対数変換後の新しいターゲット列名を定義
+TARGET_COLUMN_LOG = f"log1p_{TARGET_COLUMN}"
+
+
+if TARGET_COLUMN not in df.columns:
+    raise ValueError(f"Target column '{TARGET_COLUMN}' not found in the DataFrame.")
+
+# --- ターゲットのフィルタリング: 目的変数が 0 より大きいデータのみ使用 ---
+print(f"Original number of rows: {len(df)}")
+df = df[df[TARGET_COLUMN] > 0].copy()
+print(f"Number of rows after filtering '{TARGET_COLUMN}' > 0: {len(df)}")
+if len(df) == 0:
+    raise ValueError(f"No data remaining after filtering '{TARGET_COLUMN}' > 0. Check data or filter condition.")
+
+print(f"\nTarget variable for regression: '{TARGET_COLUMN}' (filtered > 0)")
+print("Target variable descriptive statistics (after filtering):")
+print(df[TARGET_COLUMN].describe())
+
+
+# === Cell-2.5 : Stage-CAND 生成物をマージ（分割前に実施） ===
+def _normalize_merge_keys(df_in: pd.DataFrame) -> pd.DataFrame:
+    df = df_in.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.tz_localize(None)
+    df["race_code"] = (
+        df["race_code"].astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(11)
+    )
+    df["horse_number"] = pd.to_numeric(df["horse_number"], errors="coerce").astype("Int64")
+    return df
+
+if USE_CAND_FEATURES:
+    print(f"\n◎ Loading Stage-CAND artifact: {CAND_DERIVED_PATH}")
+    cand = pl.read_parquet(CAND_DERIVED_PATH).to_pandas()
+    before_cols = set(df.columns)
+    # キー正規化を両側に適用
+    df   = _normalize_merge_keys(df)
+    cand = _normalize_merge_keys(cand)
+    # 左結合
+    MERGE_KEYS = ["date", "race_code", "horse_number"]
+    df = df.merge(cand, on=MERGE_KEYS, how="left")
+    added = [c for c in df.columns if c not in before_cols]
+    hit_ratio = df["cand_prob_4plus"].notna().mean() if "cand_prob_4plus" in df.columns else 0.0
+    print(f"   - merged CAND columns: {len(added)} -> {sorted(added)}")
+    print(f"   - CAND match coverage: {hit_ratio*100:.1f}%")
+else:
+    print("\n◎ Skipping Stage-CAND merge (USE_CAND_FEATURES=False)")
+
+
+# --- 時系列分割 ---
+if "date" not in df.columns or not pd.api.types.is_datetime64_any_dtype(df["date"]):
+    raise ValueError("'date' column is missing or not in datetime format.")
+df = df.sort_values("date").reset_index(drop=True)
+
+# ★【JRA用修正】学習データの期間をJRA用に変更
+TRAIN_START_DATE = pd.to_datetime("2016-01-01")
+#TRAIN_START_DATE = pd.to_datetime("2022-01-01")  #短縮！！！！！！！
+VALID_START_DATE = pd.to_datetime("2023-04-01")
+VALID_END_DATE = pd.to_datetime("2024-03-31")
+TEST_START_DATE = pd.to_datetime("2024-04-01")
+TEST_END_DATE = pd.to_datetime("2025-08-31")
+
+TRAIN_END_DATE = VALID_START_DATE - pd.Timedelta(days=1)
+
+print(f"\n--- Data Split Configuration ---")
+print(f"Train period: {TRAIN_START_DATE.strftime('%Y-%m-%d')} to {TRAIN_END_DATE.strftime('%Y-%m-%d')}")
+print(f"Valid period: {VALID_START_DATE.strftime('%Y-%m-%d')} to {VALID_END_DATE.strftime('%Y-%m-%d')}")
+print(f"Test period:  {TEST_START_DATE.strftime('%Y-%m-%d')} to {TEST_END_DATE.strftime('%Y-%m-%d')}")
+print("---------------------------------")
+
+
+# 学習データのフィルタリング
+train_idx = df[(df["date"] >= TRAIN_START_DATE) & (df["date"] <= TRAIN_END_DATE)].index
+valid_idx = df[(df["date"] >= VALID_START_DATE) & (df["date"] <= VALID_END_DATE)].index
+test_idx  = df[(df["date"] >= TEST_START_DATE) & (df["date"] <= TEST_END_DATE)].index
+
+train = df.loc[train_idx].copy()
+valid = df.loc[valid_idx].copy()
+test  = df.loc[test_idx].copy()
+
+
+# === Cell-2: 分割が終わった直後に追記 ===
+if USE_CAND_FEATURES and FILTER_TRAIN_BY_EXCLUDE and ("exclude_flag_095" in df.columns):
+    n0 = len(train)
+    train = train[train["exclude_flag_095"] != 1].copy()
+    print(f"◎ Train safety mask: exclude_flag_095==1 を除外 {n0 - len(train):,} 件（残 {len(train):,}）")
+
+# 学習用の重み列（無い場合は 1.0）
+def _get_weight(s: pd.Series, default=1.0):
+    if (not USE_CAND_SAMPLE_WEIGHT) or (s is None):
+        return None
+    w = s.astype("float32").fillna(default).clip(lower=1e-6, upper=10.0)
+    return w
+
+
+
+# 目的変数の対数変換
+print(f"\nApplying log1p transformation to target variable '{TARGET_COLUMN}'...")
+for _df in (train, valid, test):
+    _df[TARGET_COLUMN_LOG] = np.log1p(_df[TARGET_COLUMN])
+
+print("\n◎ Data splits for Ability Index Model (JRA):")
+print(f"   Train: {train['date'].min().strftime('%Y-%m-%d')} to {train['date'].max().strftime('%Y-%m-%d')} ({len(train)} rows)")
+print(f"   Valid: {valid['date'].min().strftime('%Y-%m-%d')} to {valid['date'].max().strftime('%Y-%m-%d')} ({len(valid)} rows)")
+print(f"   Test:  {test['date'].min().strftime('%Y-%m-%d')} to {test['date'].max().strftime('%Y-%m-%d')} ({len(test)} rows)")
+
+if train.empty or valid.empty or test.empty:
+    print("Warning: One or more data splits are empty. Check date ranges and data availability after filtering.")
+
+# ────────────────────────────────────────────────
+# Cell-3 : 特徴量エンジニアリング - JRA能力指数予測用 (高カーデ対策・キー型統一 最終版)
+# ────────────────────────────────────────────────
+print("\n◎ Feature Engineering for Ability Index Model (High Cardinality Handling)...")
+
+# ▼ CANDユーティリティ列（学習特徴には入れない）
+NON_FEATURE_CAND = ["exclude_flag_095", "sample_weight_cand"]
+
+# --- 特徴量リストの定義 ---
+print("\n◎ Defining feature columns for Ability Index model...")
+
+
+
+# --- 特徴量リストの定義 ---
+print("\n◎ Defining feature columns for Ability Index model...")
+
+# 1) リーク列・ID列の除外
+leak_cols = [
+    TARGET_COLUMN,      # 目的変数そのもの
+    TARGET_COLUMN_LOG,    # 対数変換後の目的変数
+    "finishing_position",   # 確定着順
+    "win_payout",           # 単勝配当
+    "place_payout",         # 複勝配当
+]
+base_drop_cols = ["date","race_code","start_time","bloodline_index"] # IDや予測に直接使いにくい日付情報
+
+drop_cols_final = list(set(leak_cols + base_drop_cols))
+print(f"   Columns to drop (target, direct results, IDs): {sorted(drop_cols_final)}")
+
+# 学習候補の一次リスト
+feature_cols_time_index = [c for c in train.columns if c not in drop_cols_final]
+
+# 2) カテゴリ列の抽出とカーディナリティ判定
+cat_cols_all = [c for c in feature_cols_time_index if (train[c].dtype == "object" or isinstance(train[c].dtype, pd.CategoricalDtype))]
+ALWAYS_HIGH_CARD = [c for c in ["owner_name", "breeder_name", "bloodline1", "bloodline5", "birthplace"] if c in cat_cols_all]
+cardinality = {c: train[c].nunique(dropna=False) for c in cat_cols_all}
+HIGH_CARD_THRESHOLD = 200
+high_card_auto = [c for c in cat_cols_all if cardinality[c] > HIGH_CARD_THRESHOLD]
+high_card_cols = sorted(list(set(ALWAYS_HIGH_CARD + high_card_auto)))
+
+print("   - 高カーデ判定列: ", high_card_cols)
+
+# 3) 高カーデ列は“頻度エンコード”に変換（★キー/適用ともに str で統一）
+#    本番運用（stage-today）でも同じマップを使う前提で、train+valid の分布から頻度を学習
+combined_for_encoding = pd.concat([train, valid], axis=0, ignore_index=True)
+for col in high_card_cols:
+    ser_all = combined_for_encoding[col].astype(str)
+    freq = (ser_all.value_counts(dropna=False) / len(ser_all)).astype("float32")
+    for df_ in (train, valid, test):
+        ser = df_[col].astype(str)
+        df_[f"{col}_freq"] = ser.map(freq).astype("float32").fillna(0.0)
+
+high_card_freq_cols = [f"{c}_freq" for c in high_card_cols]
+
+# 4) 残りのカテゴリ列には Rare-label 統合
+RARE_MIN_COUNT = 50
+cat_cols_small = [c for c in cat_cols_all if c not in high_card_cols]
+for col in cat_cols_small:
+    vc = train[col].value_counts(dropna=False)
+    keep_vals = set(vc[vc >= RARE_MIN_COUNT].index.tolist())
+    keep_vals_str = set(map(lambda x: 'nan' if pd.isna(x) else str(x), keep_vals))
+
+    for df_ in (train, valid, test):
+        ser = df_[col].astype(str)
+        ser = ser.where(ser.isin(keep_vals_str), '___RARE___')
+        df_[col] = ser
+
+# 5) pandas の category 型に統一
+for col in cat_cols_small:
+    cats = sorted(set(train[col].unique().tolist() + ['___RARE___']))
+    for df_ in (train, valid, test):
+        df_[col] = pd.Categorical(df_[col], categories=cats)
+
+# 6) 最終的な特徴量集合を再構築
+feature_cols_time_index = [c for c in feature_cols_time_index if c not in high_card_cols]
+feature_cols_time_index += high_card_freq_cols
+feature_cols_time_index = sorted(list(dict.fromkeys(feature_cols_time_index)))
+
+# （既存の feature_cols_time_index を作った直後）
+feature_cols_time_index = [c for c in feature_cols_time_index if c not in NON_FEATURE_CAND]
+
+# 7) LightGBM に渡すカテゴリ列は “cat_cols_small” のみ
+cat_cols = sorted(cat_cols_small)
+
+print(f"   - 最終的な特徴量数: {len(feature_cols_time_index)} (カテゴリ: {len(cat_cols)}, 高カーデfreq: {len(high_card_freq_cols)})")
+
+# 8) メタデータの保存
+# 従来の特徴量・カテゴリ列リストも互換性のため残す
+with open(TIME_INDEX_CAT_COLS_JSON_PATH, "w") as f:
+    json.dump(cat_cols, f, indent=2)
+print(f"   ✅ カテゴリ列名リストを保存しました: {TIME_INDEX_CAT_COLS_JSON_PATH}")
+
+with open(TIME_INDEX_FEATURE_JSON_PATH, "w") as f:
+    json.dump(feature_cols_time_index, f, indent=2)
+print(f"   ✅ 特徴量リストを保存しました: {TIME_INDEX_FEATURE_JSON_PATH}")
+
+# SP統一メタ（Todayで再現用）
+TIME_INDEX_CAT_META_PATH = os.path.join(ART_TIME_INDEX_DIR, "JRA_sp_cat_meta.json")
+
+# 高カーデfreqの“割合マップ”を保存
+# 本番でも使い回すため、train+valid の分布で保存
+freq_maps = {}
+for col in high_card_cols:
+    ser_all = combined_for_encoding[col].astype(str)
+    vc = (ser_all.value_counts(dropna=False) / len(ser_all)).astype('float32')
+    freq_maps[col] = {str(k): float(v) for k, v in vc.items()}
+
+# 小カーデ列のカテゴリ集合も保存
+cat_categories = {}
+for col in cat_cols_small:
+    cat_categories[col] = train[col].cat.categories.tolist()
+
+sp_cat_meta = {
+    "high_card_cols": high_card_cols,
+    "cat_cols_small": cat_cols_small,
+    "categories": cat_categories,
+    "freq_maps": freq_maps,
+    "high_card_threshold": HIGH_CARD_THRESHOLD,
+    "rare_min_count": RARE_MIN_COUNT
+}
+
+with open(TIME_INDEX_CAT_META_PATH, "w", encoding="utf-8") as f:
+    json.dump(sp_cat_meta, f, ensure_ascii=False, indent=2)
+print(f"✅ SP統一カテゴリ/頻度メタを保存しました: {TIME_INDEX_CAT_META_PATH}")
+
+
+
+# ────────────────────────────────────────────────
+# Cell-4 : LightGBM 回帰モデル学習 - JRA能力指数予測用
+# ────────────────────────────────────────────────
+print("\n◎ Training LightGBM Regressor for JRA Ability Index...")
+
+# LightGBM用のカスタム評価指標RMSLE
+def rmsle_lgb(y_pred, data):
+    y_true = data.get_label()
+    y_pred_original = np.expm1(y_pred)
+    y_true_original = np.expm1(y_true)
+    y_pred_clipped = np.maximum(0, y_pred_original)
+    rmsle_score = np.sqrt(mean_squared_log_error(y_true_original, y_pred_clipped))
+    return 'rmsle', rmsle_score, False
+
+print("[INFO] LightGBMにカテゴリ特徴量を指定してデータセットを作成します...")
+w_train = _get_weight(train.get("sample_weight_cand"))
+w_valid = _get_weight(valid.get("sample_weight_cand"))  # 評価重みは任意（無くてもOK）
+
+lgb_train = lgb.Dataset(
+    train[feature_cols_time_index],
+    label=train[TARGET_COLUMN_LOG],
+    weight=w_train,                       # ★ 重み
+    categorical_feature=cat_cols,
+    free_raw_data=True
+)
+lgb_valid = lgb.Dataset(
+    valid[feature_cols_time_index],
+    label=valid[TARGET_COLUMN_LOG],
+    weight=w_valid,                       # ★（任意）
+    reference=lgb_train,
+    categorical_feature=cat_cols,
+    free_raw_data=True
+)
+print("   - データセット作成完了（weights:",
+      "train=ON" if w_train is not None else "train=OFF",
+      ", valid=ON" if w_valid is not None else ", valid=OFF", ")")
+
+
+# ★【JRA用修正】標準的なパラメータセットに変更
+params_time_index_standard = {
+    'objective': 'regression_l2', # L2損失（RMSE）は回帰の標準
+    'metric': 'None', # fevalでカスタム指標を使うためNone
+    'seed': SEED,
+    'verbosity': -1,
+    'n_jobs': -1,
+    'learning_rate': 0.05,
+    'num_leaves': 31, # デフォルト値、過学習しにくい
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 1,
+    'lambda_l1': 0.1,
+    'lambda_l2': 0.1,
+}
+
+print(f"LightGBM Regressor params: {params_time_index_standard}")
+
+evals_result_time_index = {}
+
+model_time_index = lgb.train(
+    params_time_index_standard,
+    train_set=lgb_train,
+    num_boost_round=2000, # early_stoppingを使うので多めに設定
+    valid_sets=[lgb_train, lgb_valid],
+    valid_names=['train', 'valid'],
+    feval=rmsle_lgb,
+    callbacks=[
+        lgb.record_evaluation(evals_result_time_index),
+        lgb.early_stopping(stopping_rounds=100),
+        lgb.log_evaluation(period=100)
+    ]
+)
+
+best_iter_time_index = model_time_index.best_iteration
+print(f"Best iteration for Ability Index model: {best_iter_time_index}")
+
+print("\n--- Validation Set Performance (Best Iteration) ---")
+for metric_name, score in model_time_index.best_score['valid'].items():
+    print(f"   Valid {metric_name.upper()} : {score:.4f}")
+
+joblib.dump(model_time_index, TIME_INDEX_MODEL_PATH)
+meta_to_save_time_index = {
+    "best_iter": best_iter_time_index,
+    "params": params_time_index_standard,
+    "best_scores_valid": model_time_index.best_score['valid']
+}
+with open(TIME_INDEX_META_PATH, "w") as f:
+    json.dump(meta_to_save_time_index, f, indent=2)
+
+print(f"\n✅ JRA Ability Index model saved to {TIME_INDEX_MODEL_PATH}")
+print(f"✅ JRA Ability Index meta saved to {TIME_INDEX_META_PATH}")
+
+plt.figure(figsize=(12, 6))
+for metric_name in evals_result_time_index['train'].keys():
+    plt.plot(evals_result_time_index['train'][metric_name], label=f'Train {metric_name}')
+    plt.plot(evals_result_time_index['valid'][metric_name], label=f'Valid {metric_name}', linestyle='--')
+plt.title('Ability Index Model Training History')
+plt.xlabel('Boosting Round')
+plt.ylabel('Metric Value')
+plt.legend()
+plt.grid(True)
+plt.show()
+
+# ★★★Stage-SP 契約(スキーマ)保存（学習時の特徴空間を明示） ★★★
+# 目的: 列順・カテゴリ順・カテゴリ集合を学習時に固定し、推論時(Today)で“そのまま再現”するための契約ファイルを作成する。
+# これにより、特徴量の不整合による事故を構造的に防止する。
+print("\n◎ Saving Stage-SP Schema Contract...")
+
+# 学習で使った列だけ取り出して Train+Valid をまとめて“真実のスキーマ”とする
+train_valid_sp = pd.concat(
+    [train[feature_cols_time_index], valid[feature_cols_time_index]],
+    ignore_index=True
+)
+
+# LightGBM が内部で使っている特徴量順序を最優先で取得する
+feature_names_sp = (
+    list(model_time_index.feature_name())
+    if hasattr(model_time_index, "feature_name") and model_time_index.feature_name() is not None
+    else list(feature_cols_time_index)
+)
+
+jra_sp_schema = {
+    "feature_names": feature_names_sp,                                  # 予測時にこの並び順を保証
+    "numeric_cols":  [c for c in feature_cols_time_index if c not in cat_cols],
+    "category_cols": list(cat_cols),
+    "categories":    {}                                                 # 各カテゴリ列の学習時のカテゴリ集合（文字列）
+}
+
+# 学習時のカテゴリ空間を文字列で保存（未知値は ___RARE___ にフォールバックする前提）
+for c in jra_sp_schema["category_cols"]:
+    if c in train_valid_sp.columns and is_categorical_dtype(train_valid_sp[c].dtype):
+        cats = list(train_valid_sp[c].dtype.categories.astype(str))
+    else:
+        cats = sorted(train_valid_sp[c].astype(str).dropna().unique().tolist())
+    if "___RARE___" not in cats:
+        cats.append("___RARE___")
+    jra_sp_schema["categories"][c] = cats
+
+with open(SP_SCHEMA_PATH, "w", encoding="utf-8") as f:
+    json.dump(jra_sp_schema, f, ensure_ascii=False, indent=2)
+print(f"✅ JRA Stage-SP schema contract saved to: {SP_SCHEMA_PATH}")
+
+
+# ────────────────────────────────────────────────
+# Cell-5 : モデル評価 - JRA能力指数予測用
+# ────────────────────────────────────────────────
+print("\n◎ Evaluating Ability Index model on JRA test data...")
+
+def rmsle(y_true, y_pred):
+    y_pred_clipped = np.maximum(0, y_pred)
+    return np.sqrt(mean_squared_log_error(y_true, y_pred_clipped))
+
+log_preds = model_time_index.predict(test[feature_cols_time_index], num_iteration=best_iter_time_index)
+test_preds_time_index = np.expm1(log_preds)
+test_preds_time_index[test_preds_time_index < 0] = 0
+
+rmse_test = np.sqrt(mean_squared_error(test[TARGET_COLUMN], test_preds_time_index))
+mae_test = mean_absolute_error(test[TARGET_COLUMN], test_preds_time_index)
+r2_test = r2_score(test[TARGET_COLUMN], test_preds_time_index)
+rmsle_test = rmsle(test[TARGET_COLUMN], test_preds_time_index)
+
+print("\n--- Test Set Performance (on original scale) ---")
+print(f"   RMSE: {rmse_test:.4f}")
+print(f"   MAE : {mae_test:.4f}")
+print(f"   R2  : {r2_test:.4f}")
+print(f"   RMSLE: {rmsle_test:.4f}")
+
+plt.figure(figsize=(8, 8))
+plt.scatter(test[TARGET_COLUMN], test_preds_time_index, alpha=0.3, s=10)
+plt.plot([test[TARGET_COLUMN].min(), test[TARGET_COLUMN].max()],
+         [test[TARGET_COLUMN].min(), test[TARGET_COLUMN].max()],
+         color='red', linestyle='--', lw=2, label='Perfect Prediction')
+plt.xlabel(f"Actual {TARGET_COLUMN}")
+plt.ylabel(f"Predicted {TARGET_COLUMN}")
+plt.title(f"Actual vs. Predicted {TARGET_COLUMN} on Test Set")
+plt.grid(True)
+plt.legend()
+plt.axis('equal')
+plt.show()
+
+residuals = test[TARGET_COLUMN] - test_preds_time_index
+plt.figure(figsize=(10, 6))
+plt.scatter(test_preds_time_index, residuals, alpha=0.3, s=10)
+plt.axhline(y=0, color='red', linestyle='--', lw=2)
+plt.xlabel(f"Predicted {TARGET_COLUMN}")
+plt.ylabel("Residuals (Actual - Predicted)")
+plt.title("Residual Plot on Test Set")
+plt.grid(True)
+plt.show()
+
+# 特徴量の重要度を表示
+feature_importance_df = pd.DataFrame({
+    'feature': model_time_index.feature_name(),
+    'importance_gain': model_time_index.feature_importance(importance_type='gain'),
+}).sort_values('importance_gain', ascending=False)
+top_50_features = feature_importance_df.head(50)
+print("--- 能力指数(Stage-SP)モデルにおける特徴量の重要度 Top 50 ---")
+print(top_50_features.to_string(index=False))
+
+
+# ────────────────────────────────────────────────
+# Cell-6 : OOF予測値と最終予測データセットの作成・保存
+# ────────────────────────────────────────────────
+
+# --- ここから置換：Cell-6 / OOF 生成を TimeSeriesSplit に変更 ---
+print("\n◎ Generating OOF predictions for train set and predictions for valid/test sets...")
+
+# 時系列分割（学習期間 <= 検証期間）
+n_splits = 3
+tss = TimeSeriesSplit(n_splits=n_splits)
+
+# ★ NaN 初期化（先頭チャンクの未被覆を検知するため）
+oof_preds_log = np.full(len(train), np.nan, dtype=float)
+
+print("   Starting OOF prediction generation for train data with TimeSeriesSplit...")
+for fold_idx, (trn_idx, val_idx) in enumerate(tss.split(train)):
+    tr_start = train.iloc[trn_idx]["date"].min().date()
+    tr_end   = train.iloc[trn_idx]["date"].max().date()
+    va_start = train.iloc[val_idx]["date"].min().date()
+    va_end   = train.iloc[val_idx]["date"].max().date()
+    print(f"       Fold {fold_idx + 1}/{n_splits} | Train: {tr_start} .. {tr_end} "
+          f"({len(trn_idx)} rows) | Valid: {va_start} .. {va_end} ({len(val_idx)} rows)")
+
+    X_trn_fold = train.iloc[trn_idx][feature_cols_time_index]
+    X_val_fold = train.iloc[val_idx][feature_cols_time_index]
+    y_trn_fold = train.iloc[trn_idx][TARGET_COLUMN_LOG]
+    y_val_fold = train.iloc[val_idx][TARGET_COLUMN_LOG]
+    w_trn_fold = _get_weight(train.iloc[trn_idx].get("sample_weight_cand"))
+    w_val_fold = _get_weight(train.iloc[val_idx].get("sample_weight_cand"))
+
+    lgb_train_fold = lgb.Dataset(
+        X_trn_fold, label=y_trn_fold, weight=w_trn_fold, categorical_feature=cat_cols
+    )
+    lgb_valid_fold = lgb.Dataset(
+        X_val_fold, label=y_val_fold, weight=w_val_fold, categorical_feature=cat_cols
+    )
+
+    model_fold = lgb.train(
+        params_time_index_standard,
+        train_set=lgb_train_fold,
+        num_boost_round=1000,
+        valid_sets=[lgb_valid_fold],
+        valid_names=['valid_fold'],
+        feval=rmsle_lgb,
+        callbacks=[
+            lgb.early_stopping(stopping_rounds=100),
+            lgb.log_evaluation(period=0)
+        ]
+    )
+
+    oof_preds_log[val_idx] = model_fold.predict(
+        X_val_fold, num_iteration=model_fold.best_iteration
+    )
+
+# ★ OOF被覆率を表示（TSSでは先頭~25%が未被覆）
+mask_oof = ~np.isnan(oof_preds_log)
+print(f"   OOF filled (TimeSeriesSplit): {mask_oof.sum():,}/{len(train):,} ({100.0*mask_oof.mean():.1f}%)")
+
+# ★ 未被覆(=NaN)の OOF は「最終モデル」で穴埋め（※OOF評価には使わないが、派生特徴の健全性のため）
+if not mask_oof.all():
+    gap_pos = np.where(~mask_oof)[0]
+    X_gap = train.iloc[gap_pos][feature_cols_time_index]
+    gap_pred_log = model_time_index.predict(X_gap, num_iteration=best_iter_time_index)
+    oof_preds_log[gap_pos] = gap_pred_log
+    print(f"   Filled remaining {len(gap_pos):,} OOF gaps using final model.")
+
+print("   OOF prediction generation finished.")
+
+
+# --- ここから：pred_time_index_sp を “全行” に埋める（欠損ゼロ化） ---
+# まず OOF/Valid の最終予測を元スケールに復元
+oof_preds_time_index = np.expm1(oof_preds_log)
+oof_preds_time_index[oof_preds_time_index < 0] = 0
+
+valid_preds_log = model_time_index.predict(valid[feature_cols_time_index], num_iteration=best_iter_time_index)
+valid_preds_time_index = np.expm1(valid_preds_log)
+valid_preds_time_index[valid_preds_time_index < 0] = 0
+# test_preds_time_index は Cell-5 で作成済み
+
+print("\n   Merging (and completing) predictions back to the original DataFrame...")
+
+# 0) Train期間の“安全行/除外行”インデックスを作る
+train_all_mask  = (df["date"] >= TRAIN_START_DATE) & (df["date"] <= TRAIN_END_DATE)
+valid_mask      = (df["date"] >= VALID_START_DATE) & (df["date"] <= VALID_END_DATE)
+test_mask       = (df["date"] >= TEST_START_DATE)  & (df["date"] <= TEST_END_DATE)
+safe_train_mask = train_all_mask & (df["exclude_flag_095"] != 1)
+train_safe_idx  = df.index[safe_train_mask]
+train_excl_idx  = df.index[train_all_mask & ~safe_train_mask]
+valid_idx_full  = df.index[valid_mask]
+test_idx_full   = df.index[test_mask]
+
+# 1) NaNで初期化
+df["pred_time_index_sp"] = np.nan
+
+# 2) 安全Trainには OOF を差し込む（長さ一致を保証）
+assert len(train_safe_idx) == len(oof_preds_time_index), \
+    f"len(train_safe_idx)={len(train_safe_idx)} vs len(oof)={len(oof_preds_time_index)}"
+df.loc[train_safe_idx, "pred_time_index_sp"] = oof_preds_time_index
+
+# 3) Valid/Test は最終モデル推論で埋める
+assert len(valid_idx_full) == len(valid_preds_time_index)
+assert len(test_idx_full)  == len(test_preds_time_index)
+df.loc[valid_idx_full, "pred_time_index_sp"] = valid_preds_time_index
+df.loc[test_idx_full,  "pred_time_index_sp"] = test_preds_time_index
+
+# 4) 学習から除外した Train 行も、同じ前処理を当ててから最終モデルで推論して埋める
+if len(train_excl_idx) > 0:
+    df_ex = df.loc[train_excl_idx].copy()
+
+    # 高カーデ列: 頻度エンコード付与（学習時に保存した freq_maps を利用）
+    for col in high_card_cols:
+        map_ = freq_maps[col]
+        df_ex[f"{col}_freq"] = (
+            df_ex[col].astype(str).map(map_).astype("float32").fillna(0.0)
+        )
+
+    # 小カーデ列: Rare統合 + 学習カテゴリに合わせて category 化
+    for col in cat_cols_small:
+        learned_cats = list(train[col].cat.categories.astype(str))
+        if "___RARE___" not in learned_cats:
+            learned_cats.append("___RARE___")
+        ser = df_ex[col].astype(str)
+        ser = ser.where(ser.isin(learned_cats), "___RARE___")
+        df_ex[col] = pd.Categorical(ser, categories=learned_cats)
+
+    # 予測
+    X_ex = df_ex[feature_cols_time_index]
+    ex_pred_log = model_time_index.predict(X_ex, num_iteration=best_iter_time_index)
+    ex_pred = np.expm1(ex_pred_log)
+    ex_pred[ex_pred < 0] = 0
+    df.loc[train_excl_idx, "pred_time_index_sp"] = ex_pred
+
+# 5) 監査用メタ
+df["sp_pred_source"] = "model"
+df.loc[train_safe_idx, "sp_pred_source"] = "oof"
+df["was_excluded_sp_train"] = 0
+df.loc[train_excl_idx, "was_excluded_sp_train"] = 1
+
+# 6) カバレッジ確認
+cov = df["pred_time_index_sp"].notna().mean() * 100
+print(f"   - pred_time_index_sp coverage: {cov:.1f}% "
+      f"({df['pred_time_index_sp'].notna().sum():,}/{len(df):,})")
+print("   Merge completed successfully (no-missing for SP).")
+# --- ここまで“全行埋め” ---
+
+# ────────────────────────────────────────────────
+# Cell-7 : pred_time_index_sp からの派生特徴量作成
+# ────────────────────────────────────────────────
+print("\n◎ Creating derived features from 'pred_time_index_sp'...")
+
+df_features_sp = df.copy()
+print(f"   Starting with DataFrame shape: {df_features_sp.shape}")
+
+# --- レース内特徴量の作成 ---
+RACE_KEYS = ['date', 'race_code', 'race_number']
+if 'pred_time_index_sp' in df_features_sp.columns:
+    df_features_sp['rank_pred_time_index_sp'] = df_features_sp.groupby(RACE_KEYS)['pred_time_index_sp'].rank(method='min', ascending=False)
+    df_features_sp['mean_pred_time_index_sp_race'] = df_features_sp.groupby(RACE_KEYS)['pred_time_index_sp'].transform('mean')
+    df_features_sp['std_pred_time_index_sp_race'] = df_features_sp.groupby(RACE_KEYS)['pred_time_index_sp'].transform('std')
+
+    std_val = df_features_sp['std_pred_time_index_sp_race']
+    mean_val = df_features_sp['mean_pred_time_index_sp_race']
+    df_features_sp['dev_pred_time_index_sp_race'] = \
+        np.where(std_val.fillna(0).abs() < 1e-9, 50.0, 50.0 + 10.0 * (df_features_sp['pred_time_index_sp'] - mean_val) / std_val)
+    df_features_sp['dev_pred_time_index_sp_race'] = df_features_sp['dev_pred_time_index_sp_race'].fillna(50)
+
+    df_features_sp['top_pred_time_index_sp_race'] = df_features_sp.groupby(RACE_KEYS)['pred_time_index_sp'].transform('max')
+    df_features_sp['diff_to_top_pred_time_index_sp'] = df_features_sp['top_pred_time_index_sp_race'] - df_features_sp['pred_time_index_sp']
+    print("   Calculated race-internal features based on 'pred_time_index_sp'.")
+else:
+    print("   'pred_time_index_sp' not found. Skipping derivative feature creation.")
+
+
+# --- 既存指標との差異特徴量の作成（値と順位を分離） ---
+# 値どうしの差分は「同一スケール（time_index 系）」に限定
+value_ref_cols = [c for c in ['pred_time_index'] if c in df_features_sp.columns]
+for col in value_ref_cols:
+    df_features_sp[f'diff_sp_vs_{col}'] = df_features_sp['pred_time_index_sp'] - df_features_sp[col]
+    print(f"   Calculated value difference feature: diff_sp_vs_{col}")
+
+# 順位どうしの差分は rank 系列のみに限定
+rank_ref_cols = [c for c in ['pred_time_index_rank', 'trifecta_popularity_rank'] if c in df_features_sp.columns]
+for col in rank_ref_cols:
+    df_features_sp[f'diff_rank_sp_vs_{col}'] = df_features_sp['rank_pred_time_index_sp'] - df_features_sp[col]
+    print(f"   Calculated rank difference feature: diff_rank_sp_vs_{col}")
+
+
+print(f"\nShape of DataFrame with new SP-derived features: {df_features_sp.shape}")
+print("Example of new features (first 5 rows):")
+new_feature_cols = [c for c in df_features_sp.columns if 'pred_time_index_sp' in c or 'diff_sp' in c or 'rank_sp' in c]
+
+# JRA(NAR)
+MERGE_KEYS = ["date", "race_code", "horse_number"]
+
+# 存在する列だけ選んで安全に表示
+cols_to_show = [c for c in (new_feature_cols + MERGE_KEYS) if c in df_features_sp.columns]
+print(df_features_sp[cols_to_show].head())
+
+
+# --- 最終成果物の保存（JRA05方式：キー＋SP生成列の最小安全エクスポート） ---
+print("\n◎ Exporting Stage-SP minimal artifact (keys + SP-derived columns only)...")
+
+# ▼ 環境変数で最小エクスポートを明示（戻しやすさ確保）
+SP_MINIMAL_EXPORT = os.environ.get("STAGESP_MINIMAL_EXPORT", "1") == "1"
+
+# ▼ マージキー（JRA05と統一）
+MERGE_KEYS = ["date", "race_code", "horse_number"]
+
+# ▼ SPの“生成列”ホワイトリスト（最小コア）
+SP_VALUE_COLS_CORE = [
+    "pred_time_index_sp",
+    "rank_pred_time_index_sp",
+    "mean_pred_time_index_sp_race",
+    "std_pred_time_index_sp_race",
+    "dev_pred_time_index_sp_race",
+    "top_pred_time_index_sp_race",
+    "diff_to_top_pred_time_index_sp",
+]
+
+# ▼ 差分系は元に戻しやすいようトグルで（デフォルトOFF）
+if os.environ.get("STAGESP_EXPORT_EXTRA_DIFFS", "0") == "1":
+    SP_VALUE_COLS_EXTRA = [
+        col for col in [
+            "diff_sp_vs_pred_time_index",
+            "diff_rank_sp_vs_pred_time_index",
+            "diff_sp_vs_trifecta_popularity_rank",
+        ] if col in df_features_sp.columns
+    ]
+else:
+    SP_VALUE_COLS_EXTRA = []
+
+SP_VALUE_COLS = [c for c in (SP_VALUE_COLS_CORE + SP_VALUE_COLS_EXTRA) if c in df_features_sp.columns]
+
+# ▼ 最小安全エクスポートDFを作成（存在列のみ）
+export_cols = MERGE_KEYS + SP_VALUE_COLS
+df_sp_export = df_features_sp.loc[:, [c for c in export_cols if c in df_features_sp.columns]].copy()
+
+# ▼ キー正規化（JRA05と完全同型）
+df_sp_export["date"] = pd.to_datetime(df_sp_export["date"])
+df_sp_export["race_code"] = (
+    df_sp_export["race_code"].astype(str)
+    .str.replace(r"\.0$", "", regex=True)
+    .str.zfill(11)
+)
+df_sp_export["horse_number"] = pd.to_numeric(df_sp_export["horse_number"], errors="coerce").astype("Int64")
+
+# ▼ 32bit化（ファイルサイズ圧縮）
+for c in SP_VALUE_COLS:
+    if c in df_sp_export.columns:
+        if pd.api.types.is_float_dtype(df_sp_export[c]):
+            df_sp_export[c] = df_sp_export[c].astype("float32")
+        elif pd.api.types.is_integer_dtype(df_sp_export[c]):
+            df_sp_export[c] = df_sp_export[c].astype("Int32")
+
+# ▼ 重複キー安全処理（存在時のみ平均集約）
+if df_sp_export.duplicated(MERGE_KEYS).any():
+    num_cols = [c for c in df_sp_export.columns if c not in MERGE_KEYS]
+    agg = {c: "mean" for c in num_cols}
+    df_sp_export = df_sp_export.groupby(MERGE_KEYS, as_index=False).agg(agg)
+
+# ▼ 保存パス（既存のDERIVED_FEATURES_SP_PATHをそのまま使用）
+#    例: ".../artifacts_time_index_S/JRA_derived_features_from_sp_model.parquet"
+try:
+    try:
+        import polars as pl
+        pl.from_pandas(df_sp_export).write_parquet(DERIVED_FEATURES_SP_PATH, compression="zstd")
+    except Exception:
+        # polarsが無い/失敗した場合はpandas→pyarrowで保存
+        df_sp_export.to_parquet(DERIVED_FEATURES_SP_PATH, engine="pyarrow", compression="zstd", index=False)
+    print(f"✅ Saved minimal SP artifact: {DERIVED_FEATURES_SP_PATH}  shape={df_sp_export.shape}")
+except Exception as e:
+    print(f"❌ Error saving minimal SP artifact: {e}")
+
+# ▼ 簡易メタ（スキーマ契約）を併せて出力（JRA05準拠ファイル名）
+SP_SCHEMA_PATH = DERIVED_FEATURES_SP_PATH.replace(".parquet", "_schema.json")
+try:
+    meta = {
+        "path": DERIVED_FEATURES_SP_PATH,
+        "merge_keys": MERGE_KEYS,
+        "value_cols": SP_VALUE_COLS,
+        "dtypes": {c: str(df_sp_export[c].dtype) for c in df_sp_export.columns},
+        "n_rows": int(len(df_sp_export)),
+        "n_cols": int(df_sp_export.shape[1]),
+    }
+    with open(SP_SCHEMA_PATH, "w", encoding="utf-8") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    print(f"✅ Saved SP schema contract: {SP_SCHEMA_PATH}")
+except Exception as e:
+    print(f"❌ Error saving SP schema: {e}")
+
+# ▼ 健全性チェック（被覆率）
+nn = int(df_sp_export["pred_time_index_sp"].notna().sum()) if "pred_time_index_sp" in df_sp_export.columns else 0
+print(f"   - pred_time_index_sp 非欠損: {nn:,} / {len(df_sp_export):,} ({(100.0*nn/max(1,len(df_sp_export))):.1f}%)")
+
+print("\n--- Derived feature creation & Minimal export (Stage-SP) Finished ---")
